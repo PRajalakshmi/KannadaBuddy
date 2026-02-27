@@ -46,3 +46,6 @@ app.*.map.json
 
 # Project-local Gradle home (used when global cache is corrupted)
 /android/.gradle-home/
+
+# Python server virtual env (recreate with: cd server && python -m venv venv && pip install -r requirements.txt)
+/server/venv/
