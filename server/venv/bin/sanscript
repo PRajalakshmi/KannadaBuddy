@@ -1,0 +1,7 @@
+#!/Users/Raji/Documents/GitHub/kanndabuddy/server/venv/bin/python3.12
+import sys
+from indic_transliteration.sanscript_cli import app
+if __name__ == '__main__':
+    if sys.argv[0].endswith('.exe'):
+        sys.argv[0] = sys.argv[0][:-4]
+    sys.exit(app())
