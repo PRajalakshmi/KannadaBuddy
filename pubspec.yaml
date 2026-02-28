@@ -55,6 +55,29 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
+  mocktail: ^1.0.0
+  flutter_launcher_icons: ^0.14.3
+  flutter_native_splash: ^2.4.7
+
+# Launcher icon (run: dart run flutter_launcher_icons)
+flutter_launcher_icons:
+  image_path: "assets/icon/kannadabuddy_logo_redesign.png"
+  android: true
+  ios: true
+  macos:
+    generate: true
+
+# Native splash / launch screen (run: dart run flutter_native_splash:create)
+# Uses 1024px padded splash (logo centered, full image fits); iOS scaleAspectFit.
+flutter_native_splash:
+  color: "#1a237e"
+  image: "assets/icon/splash_logo.png"
+  android: true
+  ios: true
+  ios_content_mode: scaleAspectFit
+  android_12:
+    color: "#1a237e"
+    image: "assets/icon/splash_logo.png"
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
@@ -62,6 +85,8 @@ dev_dependencies:
 # The following section is specific to Flutter packages.
 flutter:
   uses-material-design: true
+  assets:
+    - assets/icon/
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

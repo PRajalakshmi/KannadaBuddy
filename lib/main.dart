@@ -136,9 +136,8 @@ String _serverErrorMessage(Object e) {
       s.contains('connection refused') || s.contains('network is unreachable') ||
       s.contains('failed host lookup')) {
     return 'Cannot reach server. Check:\n'
-        '• KannadaBuddy server is running on your computer (python app.py)\n'
-        '• Phone and computer are on the same Wi-Fi\n'
-        '• Server IP in lib/services/ocr_service.dart matches your computer\'s IP';
+        '• Server is running at the URL in lib/config/app_config.dart (default: kannada.astrostarveda.com)\n'
+        '• Device has internet and can reach that host';
   }
   return e.toString();
 }
@@ -318,10 +317,11 @@ class _MyAppState extends State<MyApp> {
     });
   }
 
-  void _navigateToResults(String transliteration, String translation) {
+  void _navigateToResults(String kannada, String transliteration, String translation) {
     _navigatorKey.currentState?.push(
       MaterialPageRoute<void>(
         builder: (context) => _ResultsPage(
+          kannada: kannada,
           transliteration: transliteration,
           translation: translation,
           hasUpgraded: _hasUpgraded,
@@ -360,7 +360,7 @@ class _MyAppState extends State<MyApp> {
         return;
       }
       _kannadaController.clear();
-      _navigateToResults(result.transliteration, result.translation);
+      _navigateToResults(result.text, result.transliteration, result.translation);
     } catch (e) {
       if (mounted) {
         setState(() => errorMessage = _serverErrorMessage(e));
@@ -431,7 +431,7 @@ class _MyAppState extends State<MyApp> {
         return;
       }
       if (!_hasUpgraded) await _incrementFreeUse();
-      _navigateToResults(result.transliteration, result.translation);
+      _navigateToResults(result.text, result.transliteration, result.translation);
     } catch (e) {
       if (mounted) {
         setState(() => errorMessage = _serverErrorMessage(e));
@@ -494,7 +494,7 @@ class _MyAppState extends State<MyApp> {
         return;
       }
       if (!_hasUpgraded) await _incrementFreeUse();
-      _navigateToResults(docResult.transliteration, docResult.translation);
+      _navigateToResults(docResult.text, docResult.transliteration, docResult.translation);
     } catch (e) {
       if (mounted) {
         setState(() => errorMessage = _serverErrorMessage(e));
@@ -1326,11 +1326,13 @@ class _UpgradePageState extends State<_UpgradePage> {
 }
 
 class _ResultsPage extends StatefulWidget {
+  final String kannada;
   final String transliteration;
   final String translation;
   final bool hasUpgraded;
 
   const _ResultsPage({
+    required this.kannada,
     required this.transliteration,
     required this.translation,
     required this.hasUpgraded,
@@ -1415,7 +1417,19 @@ class _ResultsPageState extends State<_ResultsPage> {
     }
   }
 
-  Widget _buildTabContent(BuildContext context, {required String content, required String title}) {
+  Widget _buildTabContent(BuildContext context, {required String content, required String title, String? cardTitle}) {
+    final theme = Theme.of(context);
+    final displayTitle = cardTitle ?? title;
+    final titleStyle = theme.textTheme.titleMedium?.copyWith(
+      fontWeight: FontWeight.w700,
+      color: const Color(0xFF0D7377),
+      letterSpacing: 0.2,
+    ) ?? const TextStyle(
+      fontSize: 18,
+      fontWeight: FontWeight.w700,
+      color: Color(0xFF0D7377),
+      letterSpacing: 0.2,
+    );
     return SingleChildScrollView(
       padding: const EdgeInsets.all(20),
       child: Column(
@@ -1425,64 +1439,71 @@ class _ResultsPageState extends State<_ResultsPage> {
             decoration: BoxDecoration(
               color: Colors.white,
               borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: const Color(0xFF0D7377).withOpacity(0.12), width: 1),
               boxShadow: [
                 BoxShadow(
-                  color: const Color(0xFF0D7377).withOpacity( 0.06),
-                  blurRadius: 12,
+                  color: const Color(0xFF0D7377).withOpacity(0.06),
+                  blurRadius: 16,
                   offset: const Offset(0, 4),
                 ),
               ],
             ),
             child: Padding(
-              padding: const EdgeInsets.all(20),
+              padding: const EdgeInsets.fromLTRB(24, 24, 24, 28),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Align(
-                    alignment: Alignment.centerRight,
-                    child: Wrap(
-                      alignment: WrapAlignment.end,
-                      spacing: 4,
-                      runSpacing: 4,
-                      children: [
-                      TextButton.icon(
-                        onPressed: () async {
-                          if (_hasUpgraded) {
-                            await Clipboard.setData(ClipboardData(text: content));
-                            if (context.mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                const SnackBar(content: Text('Copied to clipboard')),
-                              );
-                            }
-                          } else {
-                            await _refreshUpgradedAndRun(context, () async {
-                              await Clipboard.setData(ClipboardData(text: content));
-                              if (context.mounted) {
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  const SnackBar(content: Text('Copied to clipboard')),
-                                );
-                              }
-                            });
-                          }
-                        },
-                        icon: const Icon(Icons.copy_rounded, size: 20),
-                        label: const Text('Copy'),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      Expanded(
+                        child: Text(displayTitle, style: titleStyle),
                       ),
-                      TextButton.icon(
-                        onPressed: () async {
-                          if (_hasUpgraded) {
-                            await _saveAsPdf(context, title: title, content: content);
-                          } else {
-                            await _refreshUpgradedAndRun(context, () => _saveAsPdf(context, title: title, content: content));
-                          }
-                        },
-                        icon: const Icon(Icons.share_rounded, size: 20),
-                        label: const Text('Share'),
+                      Wrap(
+                        alignment: WrapAlignment.end,
+                        spacing: 4,
+                        runSpacing: 4,
+                        children: [
+                          TextButton.icon(
+                            onPressed: () async {
+                              if (_hasUpgraded) {
+                                await Clipboard.setData(ClipboardData(text: content));
+                                if (context.mounted) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(content: Text('Copied to clipboard')),
+                                  );
+                                }
+                              } else {
+                                await _refreshUpgradedAndRun(context, () async {
+                                  await Clipboard.setData(ClipboardData(text: content));
+                                  if (context.mounted) {
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      const SnackBar(content: Text('Copied to clipboard')),
+                                    );
+                                  }
+                                });
+                              }
+                            },
+                            icon: const Icon(Icons.copy_rounded, size: 20),
+                            label: const Text('Copy'),
+                          ),
+                          TextButton.icon(
+                            onPressed: () async {
+                              if (_hasUpgraded) {
+                                await _saveAsPdf(context, title: title, content: content);
+                              } else {
+                                await _refreshUpgradedAndRun(context, () => _saveAsPdf(context, title: title, content: content));
+                              }
+                            },
+                            icon: const Icon(Icons.share_rounded, size: 20),
+                            label: const Text('Share'),
+                          ),
+                        ],
                       ),
                     ],
-                    ),
                   ),
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 20),
                   SelectableText(content, style: _bodyTextStyle),
                 ],
               ),
@@ -1493,10 +1514,203 @@ class _ResultsPageState extends State<_ResultsPage> {
     );
   }
 
+  Widget _buildSummaryTab(BuildContext context) {
+    final theme = Theme.of(context);
+    const labelStyle = TextStyle(
+      fontSize: 12,
+      fontWeight: FontWeight.w600,
+      letterSpacing: 0.6,
+      color: Color(0xFF0D7377),
+    );
+    const bodyStyle = TextStyle(
+      fontSize: 16,
+      height: 1.65,
+      fontWeight: FontWeight.w400,
+      color: Color(0xFF2D3436),
+    );
+    final transliterationLines = widget.transliteration.split(RegExp(r'\r?\n'));
+    final translationLines = widget.translation.split(RegExp(r'\r?\n'));
+    final count = transliterationLines.length > translationLines.length
+        ? transliterationLines.length
+        : translationLines.length;
+    final entries = <Widget>[];
+    final summaryParts = <String>[];
+    for (int i = 0; i < count; i++) {
+      final transliterated = i < transliterationLines.length ? transliterationLines[i].trim() : '';
+      final meaning = i < translationLines.length ? translationLines[i].trim() : '';
+      if (transliterated.isEmpty && meaning.isEmpty) continue;
+      summaryParts.add('Kannada  ${transliterated.isEmpty ? '—' : transliterated}\nMeaning  ${meaning.isEmpty ? '—' : meaning}');
+      entries.add(
+        Padding(
+          padding: const EdgeInsets.only(bottom: 20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (entries.isNotEmpty)
+                Divider(
+                  height: 24,
+                  thickness: 1,
+                  color: const Color(0xFF0D7377).withOpacity(0.12),
+                ),
+              Padding(
+                padding: const EdgeInsets.only(left: 4),
+                child: SelectableText.rich(
+                  TextSpan(
+                    style: bodyStyle,
+                    children: [
+                      TextSpan(text: 'Kannada  ', style: labelStyle),
+                      TextSpan(text: transliterated.isEmpty ? '—' : transliterated),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Padding(
+                padding: const EdgeInsets.only(left: 4),
+                child: SelectableText.rich(
+                  TextSpan(
+                    style: bodyStyle,
+                    children: [
+                      TextSpan(text: 'Meaning  ', style: labelStyle),
+                      TextSpan(text: meaning.isEmpty ? '—' : meaning),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    if (entries.isEmpty) {
+      entries.add(
+        Padding(
+          padding: const EdgeInsets.only(left: 4),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SelectableText.rich(
+                TextSpan(
+                  style: bodyStyle,
+                  children: [
+                    TextSpan(text: 'Kannada  ', style: labelStyle),
+                    const TextSpan(text: '—'),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 8),
+              SelectableText.rich(
+                TextSpan(
+                  style: bodyStyle,
+                  children: [
+                    TextSpan(text: 'Meaning  ', style: labelStyle),
+                    const TextSpan(text: '—'),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    final summaryText = summaryParts.isEmpty
+        ? 'Kannada  —\nMeaning  —'
+        : summaryParts.join('\n\n');
+    return SingleChildScrollView(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.fromLTRB(24, 24, 24, 28),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: const Color(0xFF0D7377).withOpacity(0.12), width: 1),
+          boxShadow: [
+            BoxShadow(
+              color: const Color(0xFF0D7377).withOpacity(0.06),
+              blurRadius: 16,
+              offset: const Offset(0, 4),
+            ),
+          ],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Expanded(
+                  child: Text(
+                    'Summary',
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w700,
+                      color: const Color(0xFF0D7377),
+                      letterSpacing: 0.2,
+                    ) ?? const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w700,
+                      color: Color(0xFF0D7377),
+                      letterSpacing: 0.2,
+                    ),
+                  ),
+                ),
+                Wrap(
+                  alignment: WrapAlignment.end,
+                  spacing: 4,
+                  runSpacing: 4,
+                  children: [
+                    TextButton.icon(
+                      onPressed: () async {
+                        if (_hasUpgraded) {
+                          await Clipboard.setData(ClipboardData(text: summaryText));
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('Copied to clipboard')),
+                            );
+                          }
+                        } else {
+                          await _refreshUpgradedAndRun(context, () async {
+                            await Clipboard.setData(ClipboardData(text: summaryText));
+                            if (context.mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(content: Text('Copied to clipboard')),
+                              );
+                            }
+                          });
+                        }
+                      },
+                      icon: const Icon(Icons.copy_rounded, size: 20),
+                      label: const Text('Copy'),
+                    ),
+                    TextButton.icon(
+                      onPressed: () async {
+                        if (_hasUpgraded) {
+                          await _saveAsPdf(context, title: 'Summary', content: summaryText);
+                        } else {
+                          await _refreshUpgradedAndRun(context, () => _saveAsPdf(context, title: 'Summary', content: summaryText));
+                        }
+                      },
+                      icon: const Icon(Icons.share_rounded, size: 20),
+                      label: const Text('Share'),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+            const SizedBox(height: 20),
+            ...entries,
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return DefaultTabController(
-      length: 2,
+      length: 3,
       child: Scaffold(
         appBar: AppBar(
           leading: IconButton(
@@ -1513,19 +1727,34 @@ class _ResultsPageState extends State<_ResultsPage> {
             indicatorSize: TabBarIndicatorSize.tab,
             labelColor: Colors.white,
             unselectedLabelColor: Colors.white54,
-            labelStyle: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
-            unselectedLabelStyle: const TextStyle(fontWeight: FontWeight.w500, fontSize: 14),
-            tabs: const [
-              Tab(icon: Icon(Icons.transcribe_rounded, size: 22), text: 'Transliteration'),
-              Tab(icon: Icon(Icons.translate_rounded, size: 22), text: 'Translation'),
+            labelStyle: const TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
+            unselectedLabelStyle: const TextStyle(fontWeight: FontWeight.w500, fontSize: 13),
+            tabs: [
+              Tab(
+                icon: SizedBox(
+                  width: 24,
+                  height: 24,
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      Positioned(left: 0, top: 2, child: Icon(Icons.transcribe_rounded, size: 14)),
+                      Positioned(right: 0, bottom: 2, child: Icon(Icons.translate_rounded, size: 14)),
+                    ],
+                  ),
+                ),
+                text: 'Summary',
+              ),
+              const Tab(icon: Icon(Icons.transcribe_rounded, size: 20), text: 'Transliteration'),
+              const Tab(icon: Icon(Icons.translate_rounded, size: 20), text: 'Translation'),
             ],
           ),
         ),
         body: SafeArea(
           child: TabBarView(
             children: [
-              _buildTabContent(context, content: widget.transliteration, title: 'Transliteration'),
-              _buildTabContent(context, content: widget.translation, title: 'Translation'),
+              _buildSummaryTab(context),
+              _buildTabContent(context, content: widget.transliteration, title: 'Transliteration', cardTitle: 'Kannada'),
+              _buildTabContent(context, content: widget.translation, title: 'Translation', cardTitle: 'Meaning'),
             ],
           ),
         ),

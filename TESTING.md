@@ -1,5 +1,43 @@
 # Testing KannadaBuddy
 
+## 0. Automated test suite
+
+### Flutter (unit and widget tests)
+
+From the project root:
+
+```bash
+flutter pub get
+flutter test
+```
+
+This runs:
+
+- **`test/ocr_result_test.dart`** – `OcrResult` model (fields, defaults).
+- **`test/app_config_test.dart`** – App config (e.g. `ocrBaseUrl` non-empty, valid URL).
+- **`test/ocr_service_test.dart`** – `OCRService.submitKannadaText` (parsing JSON, error handling) with mocked HTTP.
+- **`test/iap_service_test.dart`** – Subscription product ID constant.
+- **`test/widget_test.dart`** – App launches, home shows “KannadaBuddy” and “Get transliteration & translation”.
+
+### Server (Python API tests)
+
+From the `server/` directory:
+
+```bash
+cd server
+pip install -r requirements.txt
+pip install pytest   # if not already installed
+python -m pytest tests/ -v
+```
+
+This runs:
+
+- **`tests/test_app.py`** – `/text` (missing/empty body → 400, valid JSON → 200 and keys), `/ocr` and `/document` (no file → 400), and helper functions (`normalize_line_endings`, `preserve_format_line_by_line`).
+
+Note: `test_text_valid_returns_200_and_keys` calls the real transliteration/translation; it may hit the network and require dependencies (e.g. `indic_transliteration`, `deep_translator`).
+
+---
+
 ## 1. Testing the upgrade flow (no real payment)
 
 You can test the **entire upgrade flow** (free limit, upgrade screen, Copy/Share gating) **without** setting up real in-app products.
