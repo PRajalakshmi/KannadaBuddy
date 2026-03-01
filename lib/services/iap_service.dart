@@ -9,13 +9,15 @@ const String kSubscriptionProductId = 'kannadabuddy_pro_monthly';
 
 /// Handles in-app purchase for the Pro subscription: load product, buy, restore,
 /// and notifies [onPurchaseSuccess] when the user has an active subscription.
+/// [onPurchaseSuccess] receives the purchase token (for linking to user on backend).
 class IAPService {
   IAPService({
     required this.onPurchaseSuccess,
     this.onPurchaseCancelOrError,
   });
 
-  final Future<void> Function() onPurchaseSuccess;
+  /// Called with purchase token (serverVerificationData) when purchase/restore succeeds.
+  final Future<void> Function(String? purchaseToken) onPurchaseSuccess;
   final void Function()? onPurchaseCancelOrError;
 
   static final InAppPurchase _iap = InAppPurchase.instance;
@@ -77,7 +79,8 @@ class IAPService {
         case PurchaseStatus.restored:
           if (purchase.pendingCompletePurchase) {
             await _iap.completePurchase(purchase);
-            await onPurchaseSuccess();
+            final token = purchase.verificationData.serverVerificationData;
+            await onPurchaseSuccess(token.isEmpty ? null : token);
           }
           break;
         case PurchaseStatus.error:

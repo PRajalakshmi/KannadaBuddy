@@ -1,12 +1,54 @@
 """
 Kannada OCR server with transliteration (Kannada -> Latin) and translation (Kannada -> English).
+Users sign in with Google; quota and subscription are tracked per user in SQLite.
 Run: pip install -r requirements.txt && python app.py
 """
+import os
 from flask import Flask, request, jsonify
 from PIL import Image
 import pytesseract
 
+from db import (
+    init_db,
+    get_or_create_user,
+    get_user_status,
+    can_use_free_quota,
+    has_pro,
+    increment_free_use,
+    link_subscription,
+)
+
 app = Flask(__name__)
+
+# Optional: set GOOGLE_CLIENT_ID to verify Google ID tokens (e.g. Android client ID from Firebase).
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+
+
+def _user_id_from_request():
+    try:
+        uid = request.headers.get("X-User-Id")
+        return int(uid) if uid else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _require_user():
+    """Returns (user_id, err_response, err_status). On success err_response and err_status are None."""
+    user_id = _user_id_from_request()
+    if user_id is None:
+        return None, jsonify({"error": "Missing or invalid X-User-Id header"}), 401
+    status = get_user_status(user_id)
+    if status is None:
+        return None, jsonify({"error": "User not found"}), 404
+    return user_id, None, None
+
+
+def _user_status_response():
+    user_id = _user_id_from_request()
+    if user_id is None:
+        return {}
+    status = get_user_status(user_id)
+    return (status or {})
 
 
 def transliterate_kannada_to_latin(text: str) -> str:
@@ -119,8 +161,86 @@ def preserve_format_line_by_line(text: str, process_fn) -> str:
     return "\n".join(result)
 
 
+def _verify_google_id_token(id_token: str):
+    """Verify Google ID token and return {"sub": google_id, "email": email} or None."""
+    if not GOOGLE_CLIENT_ID or not id_token:
+        return None
+    try:
+        from google.oauth2 import id_token
+        from google.auth.transport import requests as google_requests
+        idinfo = id_token.verify_oauth2_token(
+            id_token, google_requests.Request(), GOOGLE_CLIENT_ID
+        )
+        return {"sub": idinfo.get("sub"), "email": idinfo.get("email") or ""}
+    except Exception:
+        return None
+
+
+@app.route("/auth/google", methods=["POST"])
+def auth_google():
+    """Register or sign in with Google. Body: {"id_token": "..."} or {"google_id": "...", "email": "..."}."""
+    data = request.get_json(silent=True) or {}
+    id_token_str = (data.get("id_token") or "").strip()
+    google_id = (data.get("google_id") or "").strip()
+    email = (data.get("email") or "").strip()
+
+    if id_token_str:
+        payload = _verify_google_id_token(id_token_str)
+        if payload:
+            google_id = payload.get("sub") or ""
+            email = payload.get("email") or email
+    if not google_id or not email:
+        return jsonify({"error": "Provide id_token or both google_id and email"}), 400
+
+    out = get_or_create_user(google_id, email)
+    status = get_user_status(out["user_id"])
+    return jsonify({
+        "user_id": out["user_id"],
+        "email": out["email"],
+        "free_use_count": status["free_use_count"],
+        "free_use_limit": status["free_use_limit"],
+        "has_pro": status["has_pro"],
+    })
+
+
+@app.route("/user/status", methods=["GET"])
+def user_status():
+    """Return quota and Pro status. Header: X-User-Id."""
+    user_id, err_resp, err_status = _require_user()
+    if err_resp is not None:
+        return err_resp, err_status
+    status = get_user_status(user_id)
+    return jsonify(status)
+
+
+@app.route("/user/subscription", methods=["POST"])
+def user_subscription():
+    """Link purchase token to user. Header: X-User-Id. Body: {"purchase_token": "...", "platform": "android"|"ios"}."""
+    user_id, err_resp, err_status = _require_user()
+    if err_resp is not None:
+        return err_resp, err_status
+    data = request.get_json(silent=True) or {}
+    token = (data.get("purchase_token") or data.get("purchaseToken") or "").strip()
+    platform = (data.get("platform") or "android").strip().lower()
+    if not token:
+        return jsonify({"error": "Missing purchase_token"}), 400
+    link_subscription(user_id, token, platform)
+    return jsonify({"ok": True})
+
+
 @app.route("/ocr", methods=["POST"])
 def ocr():
+    user_id = _user_id_from_request()
+    if user_id is not None:
+        status = get_user_status(user_id)
+        if status is None:
+            return jsonify({"error": "User not found"}), 404
+        if not can_use_free_quota(user_id):
+            return jsonify({
+                "error": "Free quota exceeded. Please upgrade to Pro.",
+                "user_status": get_user_status(user_id),
+            }), 403
+
     if "image" not in request.files:
         return jsonify({"error": "No image file part named 'image'"}), 400
 
@@ -138,11 +258,12 @@ def ocr():
         transliteration = preserve_format_line_by_line(text, transliterate_kannada_to_latin) if text else ""
         translation = preserve_format_line_by_line(text, translate_kannada_to_english) if text else ""
 
-        return jsonify({
-            "text": text,
-            "transliteration": transliteration,
-            "translation": translation,
-        })
+        payload = {"text": text, "transliteration": transliteration, "translation": translation}
+        if user_id is not None:
+            if not has_pro(user_id):
+                increment_free_use(user_id)
+            payload["user_status"] = get_user_status(user_id)
+        return jsonify(payload)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -171,6 +292,17 @@ def extract_text_from_document(data: bytes, filename: str) -> str:
 
 @app.route("/document", methods=["POST"])
 def document():
+    user_id = _user_id_from_request()
+    if user_id is not None:
+        status = get_user_status(user_id)
+        if status is None:
+            return jsonify({"error": "User not found"}), 404
+        if not can_use_free_quota(user_id):
+            return jsonify({
+                "error": "Free quota exceeded. Please upgrade to Pro.",
+                "user_status": get_user_status(user_id),
+            }), 403
+
     if "document" not in request.files:
         return jsonify({"error": "No document file part named 'document'"}), 400
 
@@ -192,18 +324,30 @@ def document():
         transliteration = preserve_format_line_by_line(text, transliterate_kannada_to_latin)
         translation = preserve_format_line_by_line(text, translate_kannada_to_english)
 
-        return jsonify({
-            "text": text,
-            "transliteration": transliteration,
-            "translation": translation,
-        })
+        payload = {"text": text, "transliteration": transliteration, "translation": translation}
+        if user_id is not None:
+            if not has_pro(user_id):
+                increment_free_use(user_id)
+            payload["user_status"] = get_user_status(user_id)
+        return jsonify(payload)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/text", methods=["POST"])
 def text():
-    """Accept plain Kannada text (JSON body: {"text": "..."}) and return transliteration + translation."""
+    """Accept plain Kannada text (JSON body: {"text": "..."}). X-User-Id optional; when present, counts against quota."""
+    user_id = _user_id_from_request()
+    if user_id is not None:
+        status = get_user_status(user_id)
+        if status is None:
+            return jsonify({"error": "User not found"}), 404
+        if not can_use_free_quota(user_id):
+            return jsonify({
+                "error": "Free quota exceeded. Please upgrade to Pro.",
+                "user_status": get_user_status(user_id),
+            }), 403
+
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
     if not text:
@@ -212,14 +356,16 @@ def text():
         text = normalize_line_endings(text)
         transliteration = preserve_format_line_by_line(text, transliterate_kannada_to_latin)
         translation = preserve_format_line_by_line(text, translate_kannada_to_english)
-        return jsonify({
-            "text": text,
-            "transliteration": transliteration,
-            "translation": translation,
-        })
+        payload = {"text": text, "transliteration": transliteration, "translation": translation}
+        if user_id is not None:
+            if not has_pro(user_id):
+                increment_free_use(user_id)
+            payload["user_status"] = get_user_status(user_id)
+        return jsonify(payload)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
+    init_db()
     app.run(host="0.0.0.0", port=5001, debug=True)

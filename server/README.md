@@ -44,6 +44,8 @@ python app.py
 
 Server will be at `http://0.0.0.0:5001`. Use your machine’s IP and this port in the Flutter app (see `lib/config/app_config.dart`).
 
+On first run, a SQLite DB file `kannada_buddy.db` is created in the server folder. It stores **users** (Google ID, email, free-use count) and **subscriptions** (user ID, purchase token, platform). All OCR/document/text requests require the **X-User-Id** header (obtained after the app signs in with Google via `POST /auth/google`). Optional: set **GOOGLE_CLIENT_ID** (e.g. Android client ID from Firebase) to verify Google ID tokens; otherwise the server accepts `google_id` + `email` in the auth request body for development.
+
 ## Running on an external server
 
 When you run **app.py on an external server** (VPS, cloud VM, etc.) so the Flutter app can reach it over the internet:
@@ -73,6 +75,25 @@ When you run **app.py on an external server** (VPS, cloud VM, etc.) so the Flutt
    gunicorn -w 1 -b 0.0.0.0:5001 app:app
    ```
    Then in the app use `https://your-domain.com` if nginx serves HTTPS on 443.
+
+### After you've deployed: what to do next
+
+1. **Point the Flutter app at your server**  
+   Edit `lib/config/app_config.dart` and set the `defaultValue` to your server URL (e.g. `https://kannada.astrostarveda.com` with no trailing slash). Or build with:  
+   `flutter build appbundle --dart-define=OCR_BASE_URL=https://your-domain.com`  
+   Use **https** if your server is behind HTTPS. Rebuild the app after changing.
+
+2. **Keep the server running**  
+   Use a process manager (e.g. systemd, supervisor) or gunicorn + nginx so the app and DB stay up across reboots.
+
+3. **Database**  
+   `kannada_buddy.db` is created on first run. Ensure the process has write permission to the server directory (or set `KANNADA_DB_PATH`). Back it up if you need to keep user/subscription data.
+
+4. **Google Sign-In (optional)**  
+   To verify ID tokens on the server, set env `GOOGLE_CLIENT_ID` to your Android OAuth client ID (from Firebase/Google Cloud). Without it, the server still works using `google_id` + `email` from the app.
+
+5. **Smoke test**  
+   Install the app, sign in with Google, then use gallery/document or type Kannada and tap the translate button. If results load, the app is talking to your deployed server.
 
 ## Translation (Kannada → English)
 

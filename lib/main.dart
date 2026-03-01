@@ -11,6 +11,10 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'content/legal_content.dart';
+import 'models/ocr_result.dart';
+import 'services/auth_service.dart';
 import 'services/iap_service.dart';
 import 'services/ocr_service.dart';
 
@@ -234,6 +238,7 @@ class _MyAppState extends State<MyApp> {
   int _keyboardPageIndex = 0;
   int _freeUseCount = 0;
   bool _hasUpgraded = false;
+  final AuthService authService = AuthService();
   final OCRService ocrService = OCRService();
   final TextEditingController _kannadaController = TextEditingController();
   final FocusNode _kannadaFocusNode = FocusNode();
@@ -254,11 +259,58 @@ class _MyAppState extends State<MyApp> {
     });
   }
 
+  IAPService? _launchIAP;
+
   @override
   void initState() {
     super.initState();
     _kannadaFocusNode.addListener(_onKannadaFocusChange);
     _loadMonetizationState();
+    _restorePurchasesOnLaunch();
+    authService.isSignedIn().then((signedIn) {
+      if (signedIn && mounted) _refreshUserStatusFromBackend();
+    });
+  }
+
+  /// Re-validate subscription with the store on launch (restore); updates Pro status if store returns the subscription.
+  Future<void> _restorePurchasesOnLaunch() async {
+    await _loadMonetizationState();
+    if (!mounted) return;
+    _launchIAP = IAPService(
+      onPurchaseSuccess: (String? purchaseToken) async {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setBool(_kKeyHasUpgraded, true);
+        final uid = await authService.currentUserId();
+        if (uid != null && purchaseToken != null && purchaseToken.isNotEmpty) {
+          try {
+            await ocrService.linkSubscription(uid, purchaseToken, platform: 'android');
+          } catch (_) {}
+        }
+        if (mounted) await _loadMonetizationState();
+      },
+    );
+    final available = await _launchIAP!.initialize();
+    if (!available || !mounted) return;
+    await _launchIAP!.restore();
+    Future.delayed(const Duration(seconds: 5), () {
+      _launchIAP?.dispose();
+      _launchIAP = null;
+    });
+  }
+
+  Future<void> _refreshUserStatusFromBackend() async {
+    final uid = await authService.currentUserId();
+    if (uid == null) return;
+    try {
+      final status = await ocrService.getUserStatus(uid);
+      if (status == null || !mounted) return;
+      final prefs = await SharedPreferences.getInstance();
+      final count = status['free_use_count'] as int?;
+      final hasPro = status['has_pro'] as bool? ?? false;
+      if (count != null) await prefs.setInt(_kKeyFreeUseCount, count);
+      await prefs.setBool(_kKeyHasUpgraded, hasPro);
+      if (mounted) await _loadMonetizationState();
+    } catch (_) {}
   }
 
   Future<void> _loadMonetizationState() async {
@@ -272,14 +324,43 @@ class _MyAppState extends State<MyApp> {
     } catch (_) {}
   }
 
-  Future<void> _incrementFreeUse() async {
+  void _applyUserStatusFromResult(OcrResult? result) {
+    final status = result?.userStatus;
+    if (status == null) return;
+    final count = status['free_use_count'] as int?;
+    final hasPro = status['has_pro'] as bool? ?? false;
+    if (count != null) setState(() => _freeUseCount = count);
+    if (hasPro) setState(() => _hasUpgraded = true);
+    SharedPreferences.getInstance().then((prefs) {
+      if (count != null) prefs.setInt(_kKeyFreeUseCount, count);
+      if (hasPro) prefs.setBool(_kKeyHasUpgraded, true);
+    });
+  }
+
+  Future<void> _incrementLocalFreeUse() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt(_kKeyFreeUseCount, (prefs.getInt(_kKeyFreeUseCount) ?? 0) + 1);
     if (mounted) await _loadMonetizationState();
   }
 
+  /// Opens upgrade screen first; sign-in is shown only when user taps Subscribe on that screen.
+  Future<bool?> _openUpgradeFlow() async {
+    final upgraded = await _navigatorKey.currentState?.push<bool>(
+      MaterialPageRoute<bool>(
+        builder: (context) => _UpgradePage(
+          authService: authService,
+          onLinkSubscription: _linkSubscriptionToken,
+        ),
+      ),
+    );
+    if (upgraded == true && mounted) await _loadMonetizationState();
+    return upgraded;
+  }
+
   @override
   void dispose() {
+    _launchIAP?.dispose();
+    _launchIAP = null;
     _progressTimer?.cancel();
     _kannadaFocusNode.removeListener(_onKannadaFocusChange);
     _kannadaFocusNode.dispose();
@@ -317,6 +398,15 @@ class _MyAppState extends State<MyApp> {
     });
   }
 
+  Future<void> _linkSubscriptionToken(String? purchaseToken) async {
+    if (purchaseToken == null || purchaseToken.isEmpty) return;
+    final uid = await authService.currentUserId();
+    if (uid == null) return;
+    try {
+      await ocrService.linkSubscription(uid, purchaseToken, platform: 'android');
+    } catch (_) {}
+  }
+
   void _navigateToResults(String kannada, String transliteration, String translation) {
     _navigatorKey.currentState?.push(
       MaterialPageRoute<void>(
@@ -325,6 +415,8 @@ class _MyAppState extends State<MyApp> {
           transliteration: transliteration,
           translation: translation,
           hasUpgraded: _hasUpgraded,
+          onLinkSubscription: _linkSubscriptionToken,
+          onRequestUpgrade: _openUpgradeFlow,
         ),
       ),
     );
@@ -333,17 +425,13 @@ class _MyAppState extends State<MyApp> {
   /// Returns true if the user can proceed (under free limit or upgraded).
   Future<bool> _showUpgradeIfNeeded() async {
     if (_hasUpgraded || _freeUseCount < _kFreeUseLimit) return true;
-    final upgraded = await _navigatorKey.currentState?.push<bool>(
-      MaterialPageRoute<bool>(builder: (context) => const _UpgradePage()),
-    );
-    if (upgraded == true && mounted) await _loadMonetizationState();
+    final upgraded = await _openUpgradeFlow();
     return upgraded == true;
   }
 
   Future<void> _translateTypedText() async {
     final text = _kannadaController.text.trim();
     if (text.isEmpty) return;
-    // Text box is unlimited; only gallery & document count toward free attempts.
     setState(() {
       transliteration = '';
       translation = '';
@@ -352,9 +440,11 @@ class _MyAppState extends State<MyApp> {
     });
     _startProgressAnimation();
     try {
-      final result = await ocrService.submitKannadaText(text);
+      final userId = await authService.currentUserId();
+      final result = await ocrService.submitKannadaText(text, userId: userId);
       if (!mounted) return;
       _completeProgress();
+      _applyUserStatusFromResult(result);
       if (!_isTranslationMeaningful(text, result.translation)) {
         setState(() => errorMessage = _kUnreadableMessage);
         return;
@@ -414,9 +504,11 @@ class _MyAppState extends State<MyApp> {
     setState(() { _isLoading = true; errorMessage = null; });
     _startProgressAnimation();
     try {
-      final result = await ocrService.extractKannadaText(pickedFile.path);
+      final userId = await authService.currentUserId();
+      final result = await ocrService.extractKannadaText(pickedFile.path, userId: userId);
       if (!mounted) return;
       _completeProgress();
+      _applyUserStatusFromResult(result);
       final text = result.text.trim();
       final hasText = text.isNotEmpty;
       final englishWords = _englishWordCount(result.translation);
@@ -430,7 +522,8 @@ class _MyAppState extends State<MyApp> {
         setState(() => errorMessage = _kUnreadableMessage);
         return;
       }
-      if (!_hasUpgraded) await _incrementFreeUse();
+      final uid = await authService.currentUserId();
+      if (uid == null) await _incrementLocalFreeUse();
       _navigateToResults(result.text, result.transliteration, result.translation);
     } catch (e) {
       if (mounted) {
@@ -477,9 +570,11 @@ class _MyAppState extends State<MyApp> {
     });
     _startProgressAnimation();
     try {
-      final docResult = await ocrService.extractFromDocument(path);
+      final userId = await authService.currentUserId();
+      final docResult = await ocrService.extractFromDocument(path, userId: userId);
       if (!mounted) return;
       _completeProgress();
+      _applyUserStatusFromResult(docResult);
       final text = docResult.text.trim();
       final hasText = text.isNotEmpty;
       final englishWords = _englishWordCount(docResult.translation);
@@ -493,7 +588,8 @@ class _MyAppState extends State<MyApp> {
         setState(() => errorMessage = _kUnreadableMessage);
         return;
       }
-      if (!_hasUpgraded) await _incrementFreeUse();
+      final uid = await authService.currentUserId();
+      if (uid == null) await _incrementLocalFreeUse();
       _navigateToResults(docResult.text, docResult.transliteration, docResult.translation);
     } catch (e) {
       if (mounted) {
@@ -671,10 +767,7 @@ class _MyAppState extends State<MyApp> {
       child: InkWell(
         onTap: isOver
             ? () async {
-                final upgraded = await _navigatorKey.currentState?.push<bool>(
-                  MaterialPageRoute<bool>(builder: (context) => const _UpgradePage()),
-                );
-                if (upgraded == true && mounted) await _loadMonetizationState();
+                await _openUpgradeFlow();
               }
             : null,
         borderRadius: BorderRadius.circular(12),
@@ -842,6 +935,19 @@ class _MyAppState extends State<MyApp> {
       home: Scaffold(
         appBar: AppBar(
           title: const Text('KannadaBuddy'),
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.info_outline_rounded),
+              onPressed: () {
+                _navigatorKey.currentState?.push(
+                  MaterialPageRoute<void>(
+                    builder: (context) => const _InfoMenuPage(),
+                  ),
+                );
+              },
+              tooltip: 'Privacy, Terms, About & more',
+            ),
+          ],
         ),
         body: SafeArea(
           child: SingleChildScrollView(
@@ -1079,8 +1185,243 @@ class _MyAppState extends State<MyApp> {
   }
 }
 
+/// Sign-in with Google; on success backend registers user and returns quota/Pro status.
+class _SignInPage extends StatelessWidget {
+  const _SignInPage({required this.authService, required this.onSuccess, this.forSubscription = false});
+
+  final AuthService authService;
+  final VoidCallback onSuccess;
+  final bool forSubscription;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('KannadaBuddy')),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Icon(
+                Icons.menu_book_rounded,
+                size: 64,
+                color: const Color(0xFF0D7377).withOpacity(0.8),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                forSubscription
+                    ? 'Sign in with Google to subscribe to Pro and get unlimited use.'
+                    : 'Sign in with Google to use Kannada OCR, transliteration and translation. Your free quota is tracked per account.',
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 16, height: 1.4, color: Color(0xFF2D3436)),
+              ),
+              const SizedBox(height: 32),
+              ElevatedButton.icon(
+                onPressed: () async {
+                  try {
+                    await authService.signInWithGoogle();
+                    if (context.mounted) onSuccess();
+                  } catch (e) {
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text(e.toString())),
+                      );
+                    }
+                  }
+                },
+                icon: const Icon(Icons.login_rounded, size: 22),
+                label: const Text('Sign in with Google'),
+                style: ElevatedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  backgroundColor: const Color(0xFF0D7377),
+                  foregroundColor: Colors.white,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Menu listing Privacy Policy, Terms, About, Contact, Subscription info, Data safety.
+class _InfoMenuPage extends StatelessWidget {
+  const _InfoMenuPage();
+
+  @override
+  Widget build(BuildContext context) {
+    const teal = Color(0xFF0D7377);
+    final items = [
+      (Icons.privacy_tip_outlined, 'Privacy Policy', kPrivacyPolicyTitle, kPrivacyPolicyBody),
+      (Icons.description_outlined, 'Terms and Conditions', kTermsTitle, kTermsBody),
+      (Icons.info_outline_rounded, 'About Us', kAboutTitle, kAboutBody),
+      (Icons.email_outlined, 'Contact Us', kContactTitle, kContactBody),
+      (Icons.card_membership_outlined, 'Subscription Info', kSubscriptionInfoTitle, kSubscriptionInfoBody),
+      (Icons.security_outlined, 'Data Safety', kDataSafetyTitle, kDataSafetyBody),
+    ];
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Info & Legal'),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back_rounded),
+          onPressed: () => Navigator.of(context).pop(),
+        ),
+      ),
+      body: ListView.builder(
+        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
+        itemCount: items.length,
+        itemBuilder: (context, index) {
+          final (icon, label, title, body) = items[index];
+          return ListTile(
+            leading: Icon(icon, color: teal, size: 24),
+            title: Text(label, style: const TextStyle(fontWeight: FontWeight.w600)),
+            trailing: const Icon(Icons.chevron_right_rounded),
+            onTap: () {
+              final isContact = title == kContactTitle;
+              Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (context) => _InfoContentPage(
+                    title: title,
+                    body: body,
+                    contactEmail: isContact ? kContactEmail : null,
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// Full-screen scrollable content for one legal/info section.
+class _InfoContentPage extends StatelessWidget {
+  const _InfoContentPage({
+    required this.title,
+    required this.body,
+    this.contactEmail,
+  });
+
+  final String title;
+  final String body;
+  final String? contactEmail;
+
+  Future<void> _launchEmail(BuildContext context) async {
+    final uri = Uri(scheme: 'mailto', path: contactEmail);
+    if (await canLaunchUrl(uri)) {
+      await launchUrl(uri);
+    } else {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Cannot open email app. Email: $contactEmail')),
+        );
+      }
+    }
+  }
+
+  static const TextStyle _bodyStyle = TextStyle(
+    fontSize: 15,
+    height: 1.65,
+    color: Color(0xFF2D3436),
+  );
+
+  static const TextStyle _subtitleStyle = TextStyle(
+    fontSize: 16,
+    height: 1.5,
+    fontWeight: FontWeight.w700,
+    color: Color(0xFF0D7377),
+    letterSpacing: 0.2,
+  );
+
+  List<InlineSpan> _buildSpans(String text) {
+    final spans = <InlineSpan>[];
+    final lines = text.trim().split('\n');
+    final subtitleRegex = RegExp(r'^\s*\*\*(.+?)\*\*\s*$');
+    for (final line in lines) {
+      final trimmed = line.trim();
+      if (trimmed.isEmpty) {
+        spans.add(const TextSpan(text: '\n'));
+        continue;
+      }
+      final subtitleMatch = subtitleRegex.firstMatch(trimmed);
+      if (subtitleMatch != null) {
+        spans.add(TextSpan(text: '${subtitleMatch.group(1)!.trim()}\n', style: _subtitleStyle));
+      } else {
+        spans.addAll(_parseInlineBold(trimmed));
+        spans.add(const TextSpan(text: '\n'));
+      }
+    }
+    return spans;
+  }
+
+  List<InlineSpan> _parseInlineBold(String line) {
+    final spans = <InlineSpan>[];
+    final pattern = RegExp(r'\*\*(.+?)\*\*');
+    var start = 0;
+    for (final match in pattern.allMatches(line)) {
+      if (match.start > start) {
+        spans.add(TextSpan(text: line.substring(start, match.start), style: _bodyStyle));
+      }
+      spans.add(TextSpan(text: match.group(1)!, style: _subtitleStyle));
+      start = match.end;
+    }
+    if (start < line.length) {
+      spans.add(TextSpan(text: line.substring(start), style: _bodyStyle));
+    }
+    return spans.isEmpty ? [TextSpan(text: line, style: _bodyStyle)] : spans;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final spans = _buildSpans(body);
+    final contentSpans = spans.isNotEmpty ? spans : [TextSpan(text: body, style: _bodyStyle)];
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(title),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back_rounded),
+          onPressed: () => Navigator.of(context).pop(),
+        ),
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(20),
+              child: SelectableText.rich(
+                TextSpan(style: _bodyStyle, children: contentSpans),
+              ),
+            ),
+          ),
+          if (contactEmail != null)
+            SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.all(20),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    onPressed: () => _launchEmail(context),
+                    icon: const Icon(Icons.email_rounded),
+                    label: const Text('Send email'),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
 class _UpgradePage extends StatefulWidget {
-  const _UpgradePage();
+  const _UpgradePage({required this.authService, this.onLinkSubscription});
+  final AuthService authService;
+  final void Function(String? purchaseToken)? onLinkSubscription;
 
   @override
   State<_UpgradePage> createState() => _UpgradePageState();
@@ -1096,7 +1437,8 @@ class _UpgradePageState extends State<_UpgradePage> {
   void initState() {
     super.initState();
     _iap = IAPService(
-      onPurchaseSuccess: () async {
+      onPurchaseSuccess: (String? purchaseToken) async {
+        widget.onLinkSubscription?.call(purchaseToken);
         final prefs = await SharedPreferences.getInstance();
         await prefs.setBool(_kKeyHasUpgraded, true);
         if (!mounted) return;
@@ -1119,6 +1461,20 @@ class _UpgradePageState extends State<_UpgradePage> {
   }
 
   Future<void> _onSubscribe() async {
+    if (!await widget.authService.isSignedIn()) {
+      final signedIn = await Navigator.of(context).push<bool>(
+        MaterialPageRoute<bool>(
+          builder: (context) => _SignInPage(
+            authService: widget.authService,
+            forSubscription: true,
+            onSuccess: () {
+              Navigator.of(context).pop(true);
+            },
+          ),
+        ),
+      );
+      if (signedIn != true || !mounted) return;
+    }
     setState(() { _loading = true; _error = null; });
     if (_iap!.isAvailable && _iap!.productDetails != null) {
       final ok = await _iap!.buy();
@@ -1330,12 +1686,16 @@ class _ResultsPage extends StatefulWidget {
   final String transliteration;
   final String translation;
   final bool hasUpgraded;
+  final void Function(String? purchaseToken)? onLinkSubscription;
+  final Future<bool?> Function()? onRequestUpgrade;
 
   const _ResultsPage({
     required this.kannada,
     required this.transliteration,
     required this.translation,
     required this.hasUpgraded,
+    this.onLinkSubscription,
+    this.onRequestUpgrade,
   });
 
   @override
@@ -1360,9 +1720,7 @@ class _ResultsPageState extends State<_ResultsPage> {
   );
 
   Future<void> _refreshUpgradedAndRun(BuildContext context, Future<void> Function() action) async {
-    final upgraded = await Navigator.of(context).push<bool>(
-      MaterialPageRoute<bool>(builder: (context) => const _UpgradePage()),
-    );
+    final upgraded = await widget.onRequestUpgrade?.call() ?? false;
     if (upgraded != true || !context.mounted) return;
     final prefs = await SharedPreferences.getInstance();
     if (prefs.getBool(_kKeyHasUpgraded) ?? false) {
