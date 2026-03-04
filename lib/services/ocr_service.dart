@@ -123,8 +123,9 @@ class OCRService {
     );
   }
 
-  /// Link purchase token to the signed-in user on the backend.
-  Future<void> linkSubscription(int userId, String purchaseToken, {String platform = 'android'}) async {
+  /// Link purchase token to the signed-in user on the backend. Backend verifies with Google Play,
+  /// stores expiry in DB, and returns user_status. Returns the response map or null on error.
+  Future<Map<String, dynamic>?> linkSubscription(int userId, String purchaseToken, {String platform = 'android'}) async {
     final uri = Uri.parse('$_baseUrl/user/subscription');
     final response = await http.post(
       uri,
@@ -136,6 +137,12 @@ class OCRService {
     );
     if (response.statusCode != 200) {
       throw Exception(response.body);
+    }
+    try {
+      final body = jsonDecode(response.body) as Map<String, dynamic>;
+      return body;
+    } catch (_) {
+      return null;
     }
   }
 

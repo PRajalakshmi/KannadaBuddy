@@ -1,4 +1,4 @@
-# kanndabuddy
+# KannadaBuddy
 
 A new Flutter project.
 

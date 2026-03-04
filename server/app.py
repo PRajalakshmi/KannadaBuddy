@@ -23,6 +23,10 @@ app = Flask(__name__)
 # Optional: set GOOGLE_CLIENT_ID to verify Google ID tokens (e.g. Android client ID from Firebase).
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 
+# Google Play: package and subscription ID for server-side verification. Service account JSON via GOOGLE_APPLICATION_CREDENTIALS.
+GOOGLE_PLAY_PACKAGE = os.environ.get("GOOGLE_PLAY_PACKAGE_NAME", "com.kanndabuddy")
+GOOGLE_PLAY_SUBSCRIPTION_ID = os.environ.get("GOOGLE_PLAY_SUBSCRIPTION_ID", "kannadabuddy_pro_monthly")
+
 
 def _user_id_from_request():
     try:
@@ -41,6 +45,45 @@ def _require_user():
     if status is None:
         return None, jsonify({"error": "User not found"}), 404
     return user_id, None, None
+
+
+def _verify_android_subscription(package_name: str, subscription_id: str, purchase_token: str):
+    """
+    Verify subscription with Google Play Developer API. Returns expiry datetime in ISO (UTC) or None on failure.
+    Requires GOOGLE_APPLICATION_CREDENTIALS pointing to a service account JSON with Android Publisher access.
+    """
+    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if not creds_path or not os.path.isfile(creds_path):
+        return None
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        import datetime
+
+        creds = service_account.Credentials.from_service_account_file(
+            creds_path,
+            scopes=["https://www.googleapis.com/auth/androidpublisher"],
+        )
+        service = build("androidpublisher", "v3", credentials=creds)
+        result = (
+            service.purchases()
+            .subscriptions()
+            .get(
+                packageName=package_name,
+                subscriptionId=subscription_id,
+                token=purchase_token,
+            )
+            .execute()
+        )
+        expiry_ms = result.get("expiryTimeMillis")
+        if not expiry_ms:
+            return None
+        # expiryTimeMillis is string, milliseconds since epoch
+        ts = int(expiry_ms) / 1000.0
+        expiry_dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+        return expiry_dt.isoformat()
+    except Exception:
+        return None
 
 
 def _user_status_response():
@@ -162,7 +205,7 @@ def preserve_format_line_by_line(text: str, process_fn) -> str:
 
 
 def _verify_google_id_token(id_token: str):
-    """Verify Google ID token and return {"sub": google_id, "email": email} or None."""
+    """Verify Google ID token and return {"sub": google_id, "email": email, "name": name} or None."""
     if not GOOGLE_CLIENT_ID or not id_token:
         return None
     try:
@@ -171,32 +214,40 @@ def _verify_google_id_token(id_token: str):
         idinfo = id_token.verify_oauth2_token(
             id_token, google_requests.Request(), GOOGLE_CLIENT_ID
         )
-        return {"sub": idinfo.get("sub"), "email": idinfo.get("email") or ""}
+        return {
+            "sub": idinfo.get("sub"),
+            "email": idinfo.get("email") or "",
+            "name": idinfo.get("name") or "",
+        }
     except Exception:
         return None
 
 
 @app.route("/auth/google", methods=["POST"])
 def auth_google():
-    """Register or sign in with Google. Body: {"id_token": "..."} or {"google_id": "...", "email": "..."}."""
+    """Register or sign in with Google. Body: {"id_token": "..."} or {"google_id": "...", "email": "...", "display_name": "..."}."""
     data = request.get_json(silent=True) or {}
     id_token_str = (data.get("id_token") or "").strip()
     google_id = (data.get("google_id") or "").strip()
     email = (data.get("email") or "").strip()
+    display_name = (data.get("display_name") or "").strip() or None
 
     if id_token_str:
         payload = _verify_google_id_token(id_token_str)
         if payload:
             google_id = payload.get("sub") or ""
             email = payload.get("email") or email
+            if not display_name and payload.get("name"):
+                display_name = payload.get("name")
     if not google_id or not email:
         return jsonify({"error": "Provide id_token or both google_id and email"}), 400
 
-    out = get_or_create_user(google_id, email)
+    out = get_or_create_user(google_id, email, display_name=display_name)
     status = get_user_status(out["user_id"])
     return jsonify({
         "user_id": out["user_id"],
         "email": out["email"],
+        "display_name": status.get("display_name"),
         "free_use_count": status["free_use_count"],
         "free_use_limit": status["free_use_limit"],
         "has_pro": status["has_pro"],
@@ -215,17 +266,32 @@ def user_status():
 
 @app.route("/user/subscription", methods=["POST"])
 def user_subscription():
-    """Link purchase token to user. Header: X-User-Id. Body: {"purchase_token": "...", "platform": "android"|"ios"}."""
+    """
+    Link purchase token to user: verify with Google Play (Android), store expiry in DB, return user status.
+    Header: X-User-Id. Body: {"purchase_token": "...", "platform": "android"}.
+    Response: { "ok": true, "user_status": {...} } so the app can mark user premium.
+    """
     user_id, err_resp, err_status = _require_user()
     if err_resp is not None:
         return err_resp, err_status
     data = request.get_json(silent=True) or {}
     token = (data.get("purchase_token") or data.get("purchaseToken") or "").strip()
     platform = (data.get("platform") or "android").strip().lower()
+    expires_at = (data.get("expires_at") or data.get("expiry_date") or "").strip() or None
+
     if not token:
         return jsonify({"error": "Missing purchase_token"}), 400
-    link_subscription(user_id, token, platform)
-    return jsonify({"ok": True})
+
+    if platform == "android":
+        verified_expiry = _verify_android_subscription(
+            GOOGLE_PLAY_PACKAGE, GOOGLE_PLAY_SUBSCRIPTION_ID, token
+        )
+        if verified_expiry is not None:
+            expires_at = verified_expiry
+
+    link_subscription(user_id, token, platform, expires_at=expires_at)
+    status = get_user_status(user_id)
+    return jsonify({"ok": True, "user_status": status})
 
 
 @app.route("/ocr", methods=["POST"])
@@ -253,14 +319,15 @@ def ocr():
         img = img.point(lambda x: 0 if x < 160 else 255, "1")
         custom_config = r"--psm 6"
         text = pytesseract.image_to_string(img, lang="kan", config=custom_config)
-        text = normalize_line_endings(text or "")
+        text = normalize_line_endings(text or "").strip()
 
         transliteration = preserve_format_line_by_line(text, transliterate_kannada_to_latin) if text else ""
         translation = preserve_format_line_by_line(text, translate_kannada_to_english) if text else ""
 
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
-            if not has_pro(user_id):
+            # Only count against quota when we got meaningful text (avoid charging for photos/non-text images)
+            if text and not has_pro(user_id):
                 increment_free_use(user_id)
             payload["user_status"] = get_user_status(user_id)
         return jsonify(payload)
@@ -336,17 +403,12 @@ def document():
 
 @app.route("/text", methods=["POST"])
 def text():
-    """Accept plain Kannada text (JSON body: {"text": "..."}). X-User-Id optional; when present, counts against quota."""
+    """Accept plain Kannada text (JSON body: {"text": "..."}). Always free; quota/upgrade does not apply."""
     user_id = _user_id_from_request()
     if user_id is not None:
         status = get_user_status(user_id)
         if status is None:
             return jsonify({"error": "User not found"}), 404
-        if not can_use_free_quota(user_id):
-            return jsonify({
-                "error": "Free quota exceeded. Please upgrade to Pro.",
-                "user_status": get_user_status(user_id),
-            }), 403
 
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
@@ -358,14 +420,14 @@ def text():
         translation = preserve_format_line_by_line(text, translate_kannada_to_english)
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
-            if not has_pro(user_id):
-                increment_free_use(user_id)
             payload["user_status"] = get_user_status(user_id)
         return jsonify(payload)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
+# Ensure DB exists and has tables when app is loaded (e.g. by gunicorn).
+init_db()
+
 if __name__ == "__main__":
-    init_db()
     app.run(host="0.0.0.0", port=5001, debug=True)

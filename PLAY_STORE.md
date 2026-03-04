@@ -6,7 +6,7 @@
 |------|----------|--------|
 | **OCR server URL** | Was hardcoded in `lib/services/ocr_service.dart` | **Configurable** via `lib/config/app_config.dart`. Set for release: `flutter build appbundle --dart-define=OCR_BASE_URL=https://your-api.com` |
 | **Subscription price** | `lib/main.dart` | Single constants `kSubscriptionPrice` and `kSubscriptionPeriod` (e.g. ₹99, month). Change there for updates. |
-| **Free attempt limit** | `lib/main.dart` | `_kFreeUseLimit = 2`. Change there if you change the free tier. |
+| **Free attempt limit** | `lib/main.dart` | `_kFreeUseLimit = 5`. Change there if you change the free tier. |
 
 No API keys or secrets are stored in the repo. The app talks to your own backend; use HTTPS in production.
 

@@ -6,3 +6,5 @@ deep-translator>=1.11.4
 pypdf>=4.0.0
 python-docx>=1.1.0
 google-auth>=2.0.0
+google-api-python-client>=2.0.0
+gunicorn>=21.0.0

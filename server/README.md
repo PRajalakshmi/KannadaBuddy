@@ -76,6 +76,69 @@ When you run **app.py on an external server** (VPS, cloud VM, etc.) so the Flutt
    ```
    Then in the app use `https://your-domain.com` if nginx serves HTTPS on 443.
 
+### Fix "Server error (404)" when app calls the backend
+
+If the app shows **Server error (404)** when signing in or using OCR, the request is reaching your server but **not** your Flask app. That usually means:
+
+- You use a **domain** like `https://kannada.astrostarveda.com` (no port). Traffic on 443 is handled by **nginx** (or Apache), which is returning 404 because it does not forward these paths to app.py.
+
+**Option A – Use the port in the app URL (quick test)**  
+Point the app at Flask directly with the port:
+
+- In `lib/config/app_config.dart` set the URL to `https://kannada.astrostarveda.com:5001` (or `http://...` if you don’t have HTTPS on 5001).
+- Ensure port 5001 is open and app.py (or gunicorn) is listening on `0.0.0.0:5001`.
+
+**Option B – Proxy from nginx to Flask (recommended for production)**  
+Keep the app URL as `https://kannada.astrostarveda.com` (no port). Configure nginx to forward API requests to Flask:
+
+1. Run Flask (or gunicorn) on a local port, e.g. **5001**:  
+   `gunicorn -w 1 -b 127.0.0.1:5001 app:app`
+2. In your nginx server block for `kannada.astrostarveda.com`, add:
+
+   ```nginx
+   location /auth/ {
+       proxy_pass http://127.0.0.1:5001;
+       proxy_set_header Host $host;
+       proxy_set_header X-Real-IP $remote_addr;
+       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+       proxy_set_header X-Forwarded-Proto $scheme;
+   }
+   location /user/ {
+       proxy_pass http://127.0.0.1:5001;
+       proxy_set_header Host $host;
+       proxy_set_header X-Real-IP $remote_addr;
+       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+       proxy_set_header X-Forwarded-Proto $scheme;
+   }
+   location /ocr {
+       proxy_pass http://127.0.0.1:5001;
+       proxy_set_header Host $host;
+       proxy_set_header X-Real-IP $remote_addr;
+       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+       proxy_set_header X-Forwarded-Proto $scheme;
+       client_max_body_size 10M;
+   }
+   location /document {
+       proxy_pass http://127.0.0.1:5001;
+       proxy_set_header Host $host;
+       proxy_set_header X-Real-IP $remote_addr;
+       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+       proxy_set_header X-Forwarded-Proto $scheme;
+       client_max_body_size 20M;
+   }
+   location /text {
+       proxy_pass http://127.0.0.1:5001;
+       proxy_set_header Host $host;
+       proxy_set_header X-Real-IP $remote_addr;
+       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+       proxy_set_header X-Forwarded-Proto $scheme;
+   }
+   ```
+
+3. Reload nginx: `sudo nginx -t && sudo systemctl reload nginx`
+
+Then `https://kannada.astrostarveda.com/auth/google` will be served by Flask and the 404 will go away.
+
 ### After you've deployed: what to do next
 
 1. **Point the Flutter app at your server**  

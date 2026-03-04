@@ -21,6 +21,7 @@ class IAPService {
   final void Function()? onPurchaseCancelOrError;
 
   static final InAppPurchase _iap = InAppPurchase.instance;
+  static bool _loggedProductNotFound = false;
   StreamSubscription<List<PurchaseDetails>>? _subscription;
   ProductDetails? _productDetails;
   bool _isAvailable = false;
@@ -49,7 +50,14 @@ class IAPService {
     if (!_isAvailable) return;
     final response = await _iap.queryProductDetails({kSubscriptionProductId});
     if (response.notFoundIDs.isNotEmpty) {
-      debugPrint('IAP product not found: ${response.notFoundIDs}');
+      if (!_loggedProductNotFound) {
+        _loggedProductNotFound = true;
+        debugPrint(
+          'IAP product not found: ${response.notFoundIDs}. '
+          'Create a subscription with this exact ID in Google Play Console → Monetization → Subscriptions, '
+          'and upload the app to at least the internal testing track.',
+        );
+      }
       return;
     }
     final product = response.productDetails.isEmpty ? null : response.productDetails.first;

@@ -68,7 +68,7 @@ Use this checklist to publish **KannadaBuddy** on Google Play.
 **Policy → App content**
 
 - **App content access:** Declare if the app accesses restricted APIs (e.g. SMS, call log). KannadaBuddy typically only needs **Photos/Media/Files** (and optionally **Camera**) – declare what you actually use.
-- **Ads:** If your app does **not** show ads, select “No, my app does not contain ads.”
+- **Ads:** KannadaBuddy shows ads for free users (AdMob). Select **Yes, my app contains ads** and complete the ad declaration. Replace test AdMob IDs with production App ID and banner ad unit IDs in AndroidManifest.xml, Info.plist, and lib/main.dart before release.
 - **Content rating:** Complete the questionnaire (e.g. IARC). For an education/translation app, you’ll usually get a low rating (e.g. Everyone).
 - **Target audience:** Set age groups (e.g. 13+ or as per your policy).
 - **News app:** No (unless you qualify).

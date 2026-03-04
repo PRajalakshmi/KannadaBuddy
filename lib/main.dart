@@ -17,11 +17,13 @@ import 'models/ocr_result.dart';
 import 'services/auth_service.dart';
 import 'services/iap_service.dart';
 import 'services/ocr_service.dart';
+import 'package:google_mobile_ads/google_mobile_ads.dart';
 
 // Monetization: 2 free file/image uses, then upgrade. Copy & Share require upgrade.
 const int _kFreeUseLimit = 5;
 const String _kKeyFreeUseCount = 'kannada_buddy_free_use_count';
 const String _kKeyHasUpgraded = 'kannada_buddy_has_upgraded';
+const String _kKeyPurchaseToken = 'kannada_buddy_purchase_token';
 // Subscription price (single place for Play Store / future IAP).
 const String kSubscriptionPrice = '₹99';
 const String kSubscriptionPeriod = 'month';
@@ -35,6 +37,11 @@ const String _kUnreadableMessage =
     'We could not reliably read or translate this input. Please upload a clearer image or document and try again. '
     'Avoid blur, poor lighting, shadows, fingers or objects covering the text, cluttered backgrounds, and skewed or angled pages. '
     'Use a sharp, well-lit image cropped to the text only, with nothing obscuring the words.';
+
+/// Shown when backend says quota exceeded but app thinks user is Pro (subscription not linked).
+const String _kSubscriberQuotaMessage =
+    'Your Pro subscription wasn\'t recognized. We tried to link it — please try again. '
+    'If it still fails, open the Upgrade screen (from the menu) and tap Restore.';
 
 /// Counts space-separated tokens (words) in text (language-agnostic).
 int _wordCount(String text) {
@@ -133,20 +140,26 @@ bool _isTranslationMeaningful(
   return true;
 }
 
-/// User-friendly message when server is unreachable.
-String _serverErrorMessage(Object e) {
-  final s = e.toString().toLowerCase();
-  if (s.contains('socket') || s.contains('no route to host') ||
-      s.contains('connection refused') || s.contains('network is unreachable') ||
-      s.contains('failed host lookup')) {
-    return 'Cannot reach server. Check:\n'
-        '• Server is running at the URL in lib/config/app_config.dart (default: kannada.astrostarveda.com)\n'
-        '• Device has internet and can reach that host';
+/// Log OCR/document/translate errors for debugging. User never sees this.
+void _logOcrError(String context, Object error, [StackTrace? stackTrace]) {
+  debugPrint('[KannadaBuddy OCR error] context=$context error=$error');
+  if (stackTrace != null) {
+    debugPrint('[KannadaBuddy OCR error] stackTrace:\n$stackTrace');
   }
-  return e.toString();
 }
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  // Strict family/kids ad policy: no mature content, no personalized/interest-based ads,
+  // no remarketing or behavioural tracking, child-directed treatment, G-rated only.
+  await MobileAds.instance.updateRequestConfiguration(
+    RequestConfiguration(
+      maxAdContentRating: MaxAdContentRating.g,
+      tagForChildDirectedTreatment: TagForChildDirectedTreatment.yes,
+      tagForUnderAgeOfConsent: TagForUnderAgeOfConsent.yes,
+    ),
+  );
+  await MobileAds.instance.initialize();
   runApp(MyApp());
 }
 
@@ -238,6 +251,8 @@ class _MyAppState extends State<MyApp> {
   int _keyboardPageIndex = 0;
   int _freeUseCount = 0;
   bool _hasUpgraded = false;
+  /// Only set when an exception occurred; shown in debug mode for diagnosis.
+  String? _lastOcrErrorDetail;
   final AuthService authService = AuthService();
   final OCRService ocrService = OCRService();
   final TextEditingController _kannadaController = TextEditingController();
@@ -256,6 +271,7 @@ class _MyAppState extends State<MyApp> {
       transliteration = '';
       translation = '';
       errorMessage = null;
+      _lastOcrErrorDetail = null;
     });
   }
 
@@ -267,26 +283,35 @@ class _MyAppState extends State<MyApp> {
     _kannadaFocusNode.addListener(_onKannadaFocusChange);
     _loadMonetizationState();
     _restorePurchasesOnLaunch();
-    authService.isSignedIn().then((signedIn) {
-      if (signedIn && mounted) _refreshUserStatusFromBackend();
+    authService.restoreSignInIfNeeded().then((_) {
+      if (!mounted) return;
+      authService.isSignedIn().then((signedIn) {
+        if (signedIn && mounted) _refreshUserStatusFromBackend();
+      });
     });
   }
 
-  /// Re-validate subscription with the store on launch (restore); updates Pro status if store returns the subscription.
+  /// At launch: restore purchases from store, send token to backend (verify + store expiry), then apply user_status.
+  /// Backend is source of truth: if active → unlock premium; if expired → show subscribe button.
   Future<void> _restorePurchasesOnLaunch() async {
     await _loadMonetizationState();
     if (!mounted) return;
     _launchIAP = IAPService(
       onPurchaseSuccess: (String? purchaseToken) async {
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setBool(_kKeyHasUpgraded, true);
+        if (purchaseToken == null || purchaseToken.isEmpty) return;
+        await _savePurchaseToken(purchaseToken);
         final uid = await authService.currentUserId();
-        if (uid != null && purchaseToken != null && purchaseToken.isNotEmpty) {
-          try {
-            await ocrService.linkSubscription(uid, purchaseToken, platform: 'android');
-          } catch (_) {}
+        if (uid == null) return;
+        try {
+          final body = await ocrService.linkSubscription(uid, purchaseToken, platform: 'android');
+          if (mounted && body != null && body['user_status'] != null) {
+            _applyUserStatusFromMap(body['user_status'] as Map<String, dynamic>);
+          } else if (mounted) {
+            await _refreshUserStatusFromBackend();
+          }
+        } catch (_) {
+          if (mounted) await _refreshUserStatusFromBackend();
         }
-        if (mounted) await _loadMonetizationState();
       },
     );
     final available = await _launchIAP!.initialize();
@@ -298,18 +323,15 @@ class _MyAppState extends State<MyApp> {
     });
   }
 
+  /// Fetches user status from backend. Premium is always from backend (expiry-based); we never cache as source of truth.
+  /// At launch we use this to decide: if active → unlock premium; if expired → show subscribe button.
   Future<void> _refreshUserStatusFromBackend() async {
     final uid = await authService.currentUserId();
     if (uid == null) return;
     try {
       final status = await ocrService.getUserStatus(uid);
       if (status == null || !mounted) return;
-      final prefs = await SharedPreferences.getInstance();
-      final count = status['free_use_count'] as int?;
-      final hasPro = status['has_pro'] as bool? ?? false;
-      if (count != null) await prefs.setInt(_kKeyFreeUseCount, count);
-      await prefs.setBool(_kKeyHasUpgraded, hasPro);
-      if (mounted) await _loadMonetizationState();
+      _applyUserStatusFromMap(status);
     } catch (_) {}
   }
 
@@ -325,15 +347,23 @@ class _MyAppState extends State<MyApp> {
   }
 
   void _applyUserStatusFromResult(OcrResult? result) {
-    final status = result?.userStatus;
+    _applyUserStatusFromMap(result?.userStatus);
+  }
+
+  /// Applies backend user_status (e.g. from subscription link or /user/status) to local state and prefs.
+  void _applyUserStatusFromMap(Map<String, dynamic>? status) {
     if (status == null) return;
     final count = status['free_use_count'] as int?;
-    final hasPro = status['has_pro'] as bool? ?? false;
+    final isPremium = status['is_premium'] as bool? ?? status['has_pro'] as bool? ?? false;
+    final displayName = status['display_name'] as String?;
     if (count != null) setState(() => _freeUseCount = count);
-    if (hasPro) setState(() => _hasUpgraded = true);
+    setState(() => _hasUpgraded = isPremium);
     SharedPreferences.getInstance().then((prefs) {
       if (count != null) prefs.setInt(_kKeyFreeUseCount, count);
-      if (hasPro) prefs.setBool(_kKeyHasUpgraded, true);
+      prefs.setBool(_kKeyHasUpgraded, isPremium);
+      if (displayName != null && displayName.isNotEmpty) {
+        prefs.setString('kannada_buddy_user_display_name', displayName);
+      }
     });
   }
 
@@ -344,8 +374,12 @@ class _MyAppState extends State<MyApp> {
   }
 
   /// Opens upgrade screen first; sign-in is shown only when user taps Subscribe on that screen.
-  Future<bool?> _openUpgradeFlow() async {
-    final upgraded = await _navigatorKey.currentState?.push<bool>(
+  /// [callerContext] when set (e.g. from Results page) uses its navigator so the route actually opens.
+  Future<bool?> _openUpgradeFlow([BuildContext? callerContext]) async {
+    final navigator = callerContext != null
+        ? Navigator.of(callerContext)
+        : _navigatorKey.currentState;
+    final upgraded = await navigator?.push<bool>(
       MaterialPageRoute<bool>(
         builder: (context) => _UpgradePage(
           authService: authService,
@@ -353,7 +387,7 @@ class _MyAppState extends State<MyApp> {
         ),
       ),
     );
-    if (upgraded == true && mounted) await _loadMonetizationState();
+    if (upgraded == true && mounted) await _refreshUserStatusFromBackend();
     return upgraded;
   }
 
@@ -398,13 +432,85 @@ class _MyAppState extends State<MyApp> {
     });
   }
 
-  Future<void> _linkSubscriptionToken(String? purchaseToken) async {
-    if (purchaseToken == null || purchaseToken.isEmpty) return;
+  /// Links purchase token to current user on backend. Backend verifies with Google Play, stores expiry, returns user_status.
+  /// Applies user_status from response to mark user premium. Retries once on failure. Returns true if linked.
+  Future<bool> _linkSubscriptionToken(String? purchaseToken) async {
+    if (purchaseToken == null || purchaseToken.isEmpty) return false;
+    await _savePurchaseToken(purchaseToken);
     final uid = await authService.currentUserId();
-    if (uid == null) return;
+    if (uid == null) return false;
+    Future<Map<String, dynamic>?> doLink() => ocrService.linkSubscription(uid!, purchaseToken, platform: 'android');
+    Map<String, dynamic>? body;
     try {
-      await ocrService.linkSubscription(uid, purchaseToken, platform: 'android');
-    } catch (_) {}
+      body = await doLink();
+      if (body != null && body['user_status'] != null && mounted) {
+        _applyUserStatusFromMap(body['user_status'] as Map<String, dynamic>);
+      }
+      return true;
+    } catch (_) {
+      await Future<void>.delayed(const Duration(seconds: 2));
+      try {
+        body = await doLink();
+        if (body != null && body['user_status'] != null && mounted) {
+          _applyUserStatusFromMap(body['user_status'] as Map<String, dynamic>);
+        }
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+  }
+
+  /// Saves purchase token so we can re-link after app reopen without waiting for restore.
+  Future<void> _savePurchaseToken(String? token) async {
+    if (token == null || token.isEmpty) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kKeyPurchaseToken, token);
+  }
+
+  /// When backend returns 403: try to re-link subscription (stored token or restore), then refresh status from backend.
+  Future<bool> _tryRelinkSubscription() async {
+    final uid = await authService.currentUserId();
+    if (uid == null) return false;
+    final prefs = await SharedPreferences.getInstance();
+    final storedToken = prefs.getString(_kKeyPurchaseToken);
+    if (storedToken != null && storedToken.isNotEmpty) {
+      final linked = await _linkSubscriptionToken(storedToken);
+      if (linked) return true;
+    }
+    final completer = Completer<bool>();
+    IAPService? iap;
+    iap = IAPService(
+      onPurchaseSuccess: (String? token) async {
+        if (token == null || token.isEmpty) return;
+        await _savePurchaseToken(token);
+        try {
+          final body = await ocrService.linkSubscription(uid!, token, platform: 'android');
+          if (mounted && body != null && body['user_status'] != null) {
+            _applyUserStatusFromMap(body['user_status'] as Map<String, dynamic>);
+          }
+          if (!completer.isCompleted) completer.complete(true);
+        } catch (_) {
+          if (!completer.isCompleted) completer.complete(false);
+        } finally {
+          iap?.dispose();
+        }
+      },
+    );
+    final available = await iap.initialize();
+    if (!available) {
+      iap.dispose();
+      return false;
+    }
+    await iap.restore();
+    final linked = await completer.future.timeout(
+      const Duration(seconds: 15),
+      onTimeout: () {
+        iap?.dispose();
+        return false;
+      },
+    );
+    return linked;
   }
 
   void _navigateToResults(String kannada, String transliteration, String translation) {
@@ -416,7 +522,7 @@ class _MyAppState extends State<MyApp> {
           translation: translation,
           hasUpgraded: _hasUpgraded,
           onLinkSubscription: _linkSubscriptionToken,
-          onRequestUpgrade: _openUpgradeFlow,
+          onRequestUpgrade: (ctx) => _openUpgradeFlow(ctx),
         ),
       ),
     );
@@ -446,15 +552,35 @@ class _MyAppState extends State<MyApp> {
       _completeProgress();
       _applyUserStatusFromResult(result);
       if (!_isTranslationMeaningful(text, result.translation)) {
-        setState(() => errorMessage = _kUnreadableMessage);
+        setState(() { errorMessage = _kUnreadableMessage; _lastOcrErrorDetail = null; });
         return;
       }
       _kannadaController.clear();
       _navigateToResults(result.text, result.transliteration, result.translation);
-    } catch (e) {
-      if (mounted) {
-        setState(() => errorMessage = _serverErrorMessage(e));
-        _completeProgress();
+    } catch (e, stackTrace) {
+      _logOcrError('typed_text', e, stackTrace);
+      if (!mounted) return;
+      _completeProgress();
+      final isQuotaExceeded = e.toString().toLowerCase().contains('free quota exceeded');
+      if (isQuotaExceeded && _hasUpgraded) {
+        setState(() => errorMessage = 'Linking your subscription…');
+        final linked = await _tryRelinkSubscription();
+        if (!mounted) return;
+        if (linked) {
+          await _refreshUserStatusFromBackend();
+          if (!mounted) return;
+          setState(() { errorMessage = null; _lastOcrErrorDetail = null; });
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Subscription re-linked. Please try again.')),
+          );
+        } else {
+          setState(() { errorMessage = _kSubscriberQuotaMessage; _lastOcrErrorDetail = null; });
+        }
+      } else {
+        setState(() {
+          errorMessage = _kUnreadableMessage;
+          _lastOcrErrorDetail = e.toString();
+        });
       }
     }
   }
@@ -501,7 +627,7 @@ class _MyAppState extends State<MyApp> {
   }
 
   Future<void> _processPickedFile(XFile pickedFile) async {
-    setState(() { _isLoading = true; errorMessage = null; });
+    setState(() { _isLoading = true; errorMessage = null; _lastOcrErrorDetail = null; });
     _startProgressAnimation();
     try {
       final userId = await authService.currentUserId();
@@ -519,16 +645,36 @@ class _MyAppState extends State<MyApp> {
             result.translation,
             transliteration: result.transliteration,
           )) {
-        setState(() => errorMessage = _kUnreadableMessage);
+        setState(() { errorMessage = _kUnreadableMessage; _lastOcrErrorDetail = null; });
         return;
       }
       final uid = await authService.currentUserId();
       if (uid == null) await _incrementLocalFreeUse();
       _navigateToResults(result.text, result.transliteration, result.translation);
-    } catch (e) {
-      if (mounted) {
-        setState(() => errorMessage = _serverErrorMessage(e));
-        _completeProgress();
+    } catch (e, stackTrace) {
+      _logOcrError('image', e, stackTrace);
+      if (!mounted) return;
+      _completeProgress();
+      final isQuotaExceeded = e.toString().toLowerCase().contains('free quota exceeded');
+      if (isQuotaExceeded && _hasUpgraded) {
+        setState(() => errorMessage = 'Linking your subscription…');
+        final linked = await _tryRelinkSubscription();
+        if (!mounted) return;
+        if (linked) {
+          await _refreshUserStatusFromBackend();
+          if (!mounted) return;
+          setState(() { errorMessage = null; _lastOcrErrorDetail = null; });
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Subscription re-linked. Please try again.')),
+          );
+        } else {
+          setState(() { errorMessage = _kSubscriberQuotaMessage; _lastOcrErrorDetail = null; });
+        }
+      } else {
+        setState(() {
+          errorMessage = _kUnreadableMessage;
+          _lastOcrErrorDetail = e.toString();
+        });
       }
     }
   }
@@ -555,8 +701,10 @@ class _MyAppState extends State<MyApp> {
     if (result == null || result.files.isEmpty) return;
     final path = result.files.single.path;
     if (path == null || path.isEmpty) {
+      _logOcrError('document', 'Could not get file path for selected file');
       setState(() {
-        errorMessage = 'Could not get file path. Try saving the file to device first.';
+        errorMessage = _kUnreadableMessage;
+        _lastOcrErrorDetail = 'Could not get file path for selected file';
         transliteration = '';
         translation = '';
       });
@@ -567,6 +715,7 @@ class _MyAppState extends State<MyApp> {
       translation = '';
       _isLoading = true;
       errorMessage = null;
+      _lastOcrErrorDetail = null;
     });
     _startProgressAnimation();
     try {
@@ -585,16 +734,36 @@ class _MyAppState extends State<MyApp> {
             docResult.translation,
             transliteration: docResult.transliteration,
           )) {
-        setState(() => errorMessage = _kUnreadableMessage);
+        setState(() { errorMessage = _kUnreadableMessage; _lastOcrErrorDetail = null; });
         return;
       }
       final uid = await authService.currentUserId();
       if (uid == null) await _incrementLocalFreeUse();
       _navigateToResults(docResult.text, docResult.transliteration, docResult.translation);
-    } catch (e) {
-      if (mounted) {
-        setState(() => errorMessage = _serverErrorMessage(e));
-        _completeProgress();
+    } catch (e, stackTrace) {
+      _logOcrError('document', e, stackTrace);
+      if (!mounted) return;
+      _completeProgress();
+      final isQuotaExceeded = e.toString().toLowerCase().contains('free quota exceeded');
+      if (isQuotaExceeded && _hasUpgraded) {
+        setState(() => errorMessage = 'Linking your subscription…');
+        final linked = await _tryRelinkSubscription();
+        if (!mounted) return;
+        if (linked) {
+          await _refreshUserStatusFromBackend();
+          if (!mounted) return;
+          setState(() { errorMessage = null; _lastOcrErrorDetail = null; });
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Subscription re-linked. Please try again.')),
+          );
+        } else {
+          setState(() { errorMessage = _kSubscriberQuotaMessage; _lastOcrErrorDetail = null; });
+        }
+      } else {
+        setState(() {
+          errorMessage = _kUnreadableMessage;
+          _lastOcrErrorDetail = e.toString();
+        });
       }
     }
   }
@@ -941,7 +1110,10 @@ class _MyAppState extends State<MyApp> {
               onPressed: () {
                 _navigatorKey.currentState?.push(
                   MaterialPageRoute<void>(
-                    builder: (context) => const _InfoMenuPage(),
+                    builder: (context) => _InfoMenuPage(onUpgrade: () {
+                      Navigator.of(context).pop();
+                      _openUpgradeFlow();
+                    }),
                   ),
                 );
               },
@@ -1136,13 +1308,32 @@ class _MyAppState extends State<MyApp> {
                       border: Border.all(color: const Color(0xFFE74C3C).withOpacity( 0.3)),
                     ),
                     child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Icon(Icons.info_outline_rounded, size: 20, color: const Color(0xFFE74C3C)),
                         const SizedBox(width: 10),
                         Expanded(
-                          child: Text(
-                            errorMessage!,
-                            style: const TextStyle(color: Color(0xFFC0392B), fontSize: 14),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                errorMessage!,
+                                style: const TextStyle(color: Color(0xFFC0392B), fontSize: 14),
+                              ),
+                              if (kDebugMode && _lastOcrErrorDetail != null) ...[
+                                const SizedBox(height: 8),
+                                Text(
+                                  _lastOcrErrorDetail!,
+                                  style: TextStyle(
+                                    color: const Color(0xFFC0392B).withOpacity(0.8),
+                                    fontSize: 11,
+                                    fontFamily: 'monospace',
+                                  ),
+                                  maxLines: 4,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ],
+                            ],
                           ),
                         ),
                       ],
@@ -1151,6 +1342,12 @@ class _MyAppState extends State<MyApp> {
                 ),
               ],
                 const SizedBox(height: 20),
+              Center(
+                child: Padding(
+                  padding: const EdgeInsets.only(top: 8, bottom: 16),
+                  child: _HomeAdBanner(showForFreeUser: !_hasUpgraded),
+                ),
+              ),
                 Padding(
                   padding: const EdgeInsets.only(top: 24, bottom: 32),
                   child: Center(
@@ -1181,6 +1378,80 @@ class _MyAppState extends State<MyApp> {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// Banner ad shown only for free users; hidden for subscribers.
+class _HomeAdBanner extends StatefulWidget {
+  const _HomeAdBanner({required this.showForFreeUser});
+
+  final bool showForFreeUser;
+
+  @override
+  State<_HomeAdBanner> createState() => _HomeAdBannerState();
+}
+
+class _HomeAdBannerState extends State<_HomeAdBanner> {
+  BannerAd? _bannerAd;
+  bool _isLoaded = false;
+
+  static String get _bannerAdUnitId {
+    if (Platform.isAndroid) {
+      return 'ca-app-pub-3940256099942544/6300978111';
+    }
+    return 'ca-app-pub-3940256099942544/2934735716';
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.showForFreeUser) _loadAd();
+  }
+
+  @override
+  void didUpdateWidget(_HomeAdBanner oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.showForFreeUser && !oldWidget.showForFreeUser) {
+      _loadAd();
+    } else if (!widget.showForFreeUser && oldWidget.showForFreeUser) {
+      _bannerAd?.dispose();
+      _bannerAd = null;
+      if (mounted) setState(() => _isLoaded = false);
+    }
+  }
+
+  void _loadAd() {
+    _bannerAd?.dispose();
+    _bannerAd = BannerAd(
+      adUnitId: _bannerAdUnitId,
+      size: AdSize.banner,
+      request: const AdRequest(),
+      listener: BannerAdListener(
+        onAdLoaded: (Ad ad) {
+          if (mounted) setState(() => _isLoaded = true);
+        },
+        onAdFailedToLoad: (Ad ad, LoadAdError error) {},
+      ),
+    )..load();
+  }
+
+  @override
+  void dispose() {
+    _bannerAd?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!widget.showForFreeUser) return const SizedBox.shrink();
+    if (!_isLoaded || _bannerAd == null) {
+      return const SizedBox(height: 50);
+    }
+    return SizedBox(
+      width: _bannerAd!.size.width.toDouble(),
+      height: _bannerAd!.size.height.toDouble(),
+      child: AdWidget(ad: _bannerAd!),
     );
   }
 }
@@ -1247,9 +1518,11 @@ class _SignInPage extends StatelessWidget {
   }
 }
 
-/// Menu listing Privacy Policy, Terms, About, Contact, Subscription info, Data safety.
+/// Menu listing Upgrade, Privacy Policy, Terms, About, Contact, Subscription info, Data safety.
 class _InfoMenuPage extends StatelessWidget {
-  const _InfoMenuPage();
+  const _InfoMenuPage({this.onUpgrade});
+
+  final VoidCallback? onUpgrade;
 
   @override
   Widget build(BuildContext context) {
@@ -1270,29 +1543,55 @@ class _InfoMenuPage extends StatelessWidget {
           onPressed: () => Navigator.of(context).pop(),
         ),
       ),
-      body: ListView.builder(
+      body: ListView(
         padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
-        itemCount: items.length,
-        itemBuilder: (context, index) {
-          final (icon, label, title, body) = items[index];
-          return ListTile(
-            leading: Icon(icon, color: teal, size: 24),
-            title: Text(label, style: const TextStyle(fontWeight: FontWeight.w600)),
-            trailing: const Icon(Icons.chevron_right_rounded),
-            onTap: () {
-              final isContact = title == kContactTitle;
-              Navigator.of(context).push(
-                MaterialPageRoute<void>(
-                  builder: (context) => _InfoContentPage(
-                    title: title,
-                    body: body,
-                    contactEmail: isContact ? kContactEmail : null,
-                  ),
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 16),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: AspectRatio(
+                aspectRatio: 1024 / 500,
+                child: Image.asset(
+                  'assets/feature-graphic.png',
+                  fit: BoxFit.cover,
                 ),
-              );
-            },
-          );
-        },
+              ),
+            ),
+          ),
+          if (onUpgrade != null)
+            ListTile(
+              leading: Icon(Icons.workspace_premium_rounded, color: teal, size: 24),
+              title: const Text('Upgrade & Restore', style: TextStyle(fontWeight: FontWeight.w600)),
+              subtitle: const Text('Subscribe to Pro or restore your purchase'),
+              trailing: const Icon(Icons.chevron_right_rounded),
+              onTap: () {
+                Navigator.of(context).pop();
+                onUpgrade!();
+              },
+            ),
+          if (onUpgrade != null) const Divider(height: 1),
+          ...List.generate(items.length, (index) {
+            final (icon, label, title, body) = items[index];
+            return ListTile(
+              leading: Icon(icon, color: teal, size: 24),
+              title: Text(label, style: const TextStyle(fontWeight: FontWeight.w600)),
+              trailing: const Icon(Icons.chevron_right_rounded),
+              onTap: () {
+                final isContact = title == kContactTitle;
+                Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (context) => _InfoContentPage(
+                      title: title,
+                      body: body,
+                      contactEmail: isContact ? kContactEmail : null,
+                    ),
+                  ),
+                );
+              },
+            );
+          }),
+        ],
       ),
     );
   }
@@ -1421,7 +1720,7 @@ class _InfoContentPage extends StatelessWidget {
 class _UpgradePage extends StatefulWidget {
   const _UpgradePage({required this.authService, this.onLinkSubscription});
   final AuthService authService;
-  final void Function(String? purchaseToken)? onLinkSubscription;
+  final Future<void> Function(String? purchaseToken)? onLinkSubscription;
 
   @override
   State<_UpgradePage> createState() => _UpgradePageState();
@@ -1432,15 +1731,19 @@ class _UpgradePageState extends State<_UpgradePage> {
   bool _storeReady = false;
   bool _loading = false;
   String? _error;
+  String? _userName;
 
   @override
   void initState() {
     super.initState();
+    widget.authService.currentUserName().then((name) {
+      if (mounted && name != null && name.isNotEmpty) {
+        setState(() => _userName = name);
+      }
+    });
     _iap = IAPService(
       onPurchaseSuccess: (String? purchaseToken) async {
-        widget.onLinkSubscription?.call(purchaseToken);
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setBool(_kKeyHasUpgraded, true);
+        await widget.onLinkSubscription?.call(purchaseToken);
         if (!mounted) return;
         setState(() => _loading = false);
         Navigator.of(context).pop(true);
@@ -1461,6 +1764,8 @@ class _UpgradePageState extends State<_UpgradePage> {
   }
 
   Future<void> _onSubscribe() async {
+    if (!mounted) return;
+    setState(() { _loading = true; _error = null; });
     if (!await widget.authService.isSignedIn()) {
       final signedIn = await Navigator.of(context).push<bool>(
         MaterialPageRoute<bool>(
@@ -1473,25 +1778,56 @@ class _UpgradePageState extends State<_UpgradePage> {
           ),
         ),
       );
-      if (signedIn != true || !mounted) return;
-    }
-    setState(() { _loading = true; _error = null; });
-    if (_iap!.isAvailable && _iap!.productDetails != null) {
-      final ok = await _iap!.buy();
       if (!mounted) return;
-      if (!ok) {
-        setState(() { _loading = false; _error = 'Could not start purchase.'; });
+      final name = await widget.authService.currentUserName();
+      if (mounted) setState(() { _loading = false; if (name != null && name.isNotEmpty) _userName = name; });
+      if (signedIn != true) return;
+      if (mounted) setState(() => _loading = true);
+    }
+    if (!mounted) return;
+    // Connect billing client and query subscription product when user taps Subscribe
+    final connected = await _iap!.initialize();
+    if (mounted) setState(() => _storeReady = _iap!.isAvailable);
+    if (!connected || !_iap!.isAvailable) {
+      if (!mounted) return;
+      setState(() { _loading = false; _error = 'Billing is not available. Check your connection and try again.'; });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Billing is not available. Check your connection.'), duration: Duration(seconds: 4)),
+        );
       }
-    } else {
-      if (kDebugMode) {
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setBool(_kKeyHasUpgraded, true);
-        if (mounted) Navigator.of(context).pop(true);
-      } else {
-        setState(() {
-          _loading = false;
-          _error = 'Store not available. Try again later.';
-        });
+      return;
+    }
+    if (_iap!.productDetails == null) {
+      await _iap!.loadProducts();
+      if (mounted) setState(() {});
+    }
+    if (!mounted) return;
+    if (_iap!.productDetails == null) {
+      const productId = 'kannadabuddy_pro_monthly';
+      setState(() {
+        _loading = false;
+        _error = 'Subscription not available yet. In Play Console add a subscription with ID “$productId” (Monetize → Subscriptions), activate it, and use a tester account.';
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Add subscription “kannadabuddy_pro_monthly” in Play Console → Monetize → Subscriptions.'),
+            duration: Duration(seconds: 5),
+          ),
+        );
+      }
+      return;
+    }
+    // Launch Google payment UI
+    final ok = await _iap!.buy();
+    if (!mounted) return;
+    if (!ok) {
+      setState(() { _loading = false; _error = 'Could not open payment screen. Try Restore if you already subscribed.'; });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not start purchase. Try Restore if you already subscribed.'), duration: Duration(seconds: 4)),
+        );
       }
     }
   }
@@ -1518,48 +1854,26 @@ class _UpgradePageState extends State<_UpgradePage> {
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
                     const SizedBox(height: 16),
-                    Container(
-                      padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 24),
-                      decoration: BoxDecoration(
-                        gradient: LinearGradient(
-                          colors: [primary, primaryLight],
-                          begin: Alignment.topLeft,
-                          end: Alignment.bottomRight,
+                    if (_userName != null && _userName!.isNotEmpty) ...[
+                      Text(
+                        'Welcome, $_userName',
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w600,
+                          color: primary.withOpacity(0.9),
                         ),
-                        borderRadius: BorderRadius.circular(20),
-                        boxShadow: [
-                          BoxShadow(
-                            color: primary.withOpacity(0.35),
-                            blurRadius: 16,
-                            offset: const Offset(0, 6),
-                          ),
-                        ],
+                        textAlign: TextAlign.center,
                       ),
-                      child: Column(
-                        children: [
-                          Icon(Icons.workspace_premium_rounded, size: 52, color: Colors.white.withOpacity(0.95)),
-                          const SizedBox(height: 12),
-                          const Text(
-                            'Unlock full access',
-                            textAlign: TextAlign.center,
-                            style: TextStyle(
-                              fontSize: 24,
-                              fontWeight: FontWeight.bold,
-                              color: Colors.white,
-                              letterSpacing: 0.3,
-                            ),
-                          ),
-                          const SizedBox(height: 6),
-                          Text(
-                            'Get transliteration & translation without limits',
-                            textAlign: TextAlign.center,
-                            style: TextStyle(
-                              fontSize: 15,
-                              color: Colors.white.withOpacity(0.9),
-                              height: 1.35,
-                            ),
-                          ),
-                        ],
+                      const SizedBox(height: 12),
+                    ],
+                    SizedBox(
+                      height: 170,
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(20),
+                        child: Image.asset(
+                          'assets/feature-graphic.png',
+                          fit: BoxFit.cover,
+                        ),
                       ),
                     ),
                     const SizedBox(height: 28),
@@ -1687,7 +2001,7 @@ class _ResultsPage extends StatefulWidget {
   final String translation;
   final bool hasUpgraded;
   final void Function(String? purchaseToken)? onLinkSubscription;
-  final Future<bool?> Function()? onRequestUpgrade;
+  final Future<bool?> Function(BuildContext)? onRequestUpgrade;
 
   const _ResultsPage({
     required this.kannada,
@@ -1720,7 +2034,7 @@ class _ResultsPageState extends State<_ResultsPage> {
   );
 
   Future<void> _refreshUpgradedAndRun(BuildContext context, Future<void> Function() action) async {
-    final upgraded = await widget.onRequestUpgrade?.call() ?? false;
+    final upgraded = await widget.onRequestUpgrade?.call(context) ?? false;
     if (upgraded != true || !context.mounted) return;
     final prefs = await SharedPreferences.getInstance();
     if (prefs.getBool(_kKeyHasUpgraded) ?? false) {
