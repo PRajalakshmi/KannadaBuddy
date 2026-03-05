@@ -111,6 +111,19 @@ def has_pro(user_id: int) -> bool:
         return row is not None
 
 
+def _get_active_subscription_expiry(user_id: int):
+    """Return expiry_date (ISO string or None) of the user's active subscription, or None."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT expiry_date FROM subscriptions WHERE user_id = ?
+               AND (expiry_date IS NULL OR expiry_date > ?)
+               ORDER BY expiry_date IS NULL, expiry_date DESC LIMIT 1""",
+            (user_id, now),
+        ).fetchone()
+        return row["expiry_date"] if row and row["expiry_date"] else None
+
+
 def get_user_status(user_id: int):
     user = get_user(user_id)
     if not user:
@@ -118,6 +131,7 @@ def get_user_status(user_id: int):
     premium = has_pro(user_id)
     free_count = user["free_use_count"]
     free_left = max(0, FREE_USE_LIMIT - free_count) if not premium else None
+    expiry = _get_active_subscription_expiry(user_id) if premium else None
     return {
         "user_id": user["id"],
         "email": user["email"],
@@ -128,6 +142,7 @@ def get_user_status(user_id: int):
         "is_premium": premium,
         "free_scans_left": free_left if free_left is not None else "unlimited",
         "show_ads": not premium,
+        "subscription_expiry": expiry,
     }
 
 

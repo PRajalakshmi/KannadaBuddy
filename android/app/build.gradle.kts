@@ -63,6 +63,8 @@ android {
             } else {
                 signingConfigs.getByName("debug")
             }
+            // Shrink unused resources (images, etc.) in release. Safe for Flutter.
+            isShrinkResources = true
         }
     }
 }

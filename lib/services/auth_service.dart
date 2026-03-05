@@ -49,19 +49,28 @@ class AuthService {
     return id != null;
   }
 
-  /// Restore Google account on app start so sign-in persists. If we have no stored
-  /// user_id but silent sign-in succeeds, re-register with backend and store user_id.
+  /// Restore Google account on every app launch so the user is remembered (especially subscribers).
+  /// If we have stored user_id: restore Google session and keep/update display_name.
+  /// If we have no stored user_id but silent sign-in succeeds: register with backend and store user_id, email, display_name.
   Future<void> restoreSignInIfNeeded() async {
     try {
       final account = await _googleSignIn.signInSilently();
       if (account == null) return;
       final prefs = await SharedPreferences.getInstance();
-      if (prefs.getInt(_keyUserId) != null) return;
+      final existingUserId = prefs.getInt(_keyUserId);
+      if (existingUserId != null) {
+        // Already signed in: keep user remembered, refresh display_name from Google if available
+        final name = account.displayName;
+        if (name != null && name.isNotEmpty) {
+          await prefs.setString(_keyUserDisplayName, name);
+        }
+        return;
+      }
       final auth = await account.authentication;
       final idToken = auth.idToken;
       final email = account.email ?? '';
-      final uri = Uri.parse('$_baseUrl/auth/google');
       final name = account.displayName ?? '';
+      final uri = Uri.parse('$_baseUrl/auth/google');
       final body = idToken != null && idToken.isNotEmpty
           ? jsonEncode({'id_token': idToken, 'display_name': name})
           : jsonEncode({'google_id': account.id, 'email': email, 'display_name': name});
@@ -76,8 +85,10 @@ class AuthService {
       if (userId != null) {
         await prefs.setInt(_keyUserId, userId);
         await prefs.setString(_keyUserEmail, (data?['email'] as String?) ?? email);
-        final name = data?['display_name'] as String?;
-        if (name != null && name.isNotEmpty) {
+        final nameFromServer = data?['display_name'] as String?;
+        if (nameFromServer != null && nameFromServer.isNotEmpty) {
+          await prefs.setString(_keyUserDisplayName, nameFromServer);
+        } else if (name.isNotEmpty) {
           await prefs.setString(_keyUserDisplayName, name);
         }
       }

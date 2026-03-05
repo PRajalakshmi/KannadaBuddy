@@ -84,13 +84,16 @@ class IAPService {
         case PurchaseStatus.pending:
           break;
         case PurchaseStatus.purchased:
-        case PurchaseStatus.restored:
+        case PurchaseStatus.restored: {
+          final token = purchase.verificationData.serverVerificationData;
           if (purchase.pendingCompletePurchase) {
             await _iap.completePurchase(purchase);
-            final token = purchase.verificationData.serverVerificationData;
-            await onPurchaseSuccess(token.isEmpty ? null : token);
+          }
+          if (token.isNotEmpty) {
+            await onPurchaseSuccess(token);
           }
           break;
+        }
         case PurchaseStatus.error:
           debugPrint('IAP error: ${purchase.error}');
           onPurchaseCancelOrError?.call();

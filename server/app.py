@@ -4,6 +4,7 @@ Users sign in with Google; quota and subscription are tracked per user in SQLite
 Run: pip install -r requirements.txt && python app.py
 """
 import os
+import re
 from flask import Flask, request, jsonify
 from PIL import Image
 import pytesseract
@@ -94,15 +95,40 @@ def _user_status_response():
     return (status or {})
 
 
+# Kannada script Unicode range (U+0C80–U+0CFF). Lines with no Kannada are left as-is (e.g. English, numbers, URLs).
+_KANNADA_RE = re.compile(r"[\u0C80-\u0CFF]")
+
+
+def _is_kannada_line(line: str) -> bool:
+    """True if the line contains Kannada script; otherwise treat as English/non-Kannada and pass through unchanged."""
+    return bool(_KANNADA_RE.search(line))
+
+
 def transliterate_kannada_to_latin(text: str) -> str:
-    """Convert Kannada script to Latin (IAST)."""
+    """Convert Kannada script to Latin (IAST). Non-Kannada lines are returned unchanged."""
     if not text or not text.strip():
         return ""
+    if not _is_kannada_line(text):
+        return text.strip()
     try:
         from indic_transliteration.sanscript import transliterate
         return transliterate(text.strip(), "kannada", "iast")
     except Exception:
         return ""
+
+
+def _transliterate_line_passthrough(line: str) -> str:
+    """Transliterate only if line has Kannada; otherwise return as-is."""
+    if not line.strip():
+        return ""
+    return line if not _is_kannada_line(line) else (transliterate_kannada_to_latin(line) or line)
+
+
+def _translate_line_passthrough(line: str) -> str:
+    """Translate only if line has Kannada; otherwise return as-is."""
+    if not line.strip():
+        return ""
+    return line if not _is_kannada_line(line) else (translate_kannada_to_english(line) or line)
 
 
 # Optional: preferred terms for Kannada→English (e.g. homework/school context).
@@ -321,8 +347,8 @@ def ocr():
         text = pytesseract.image_to_string(img, lang="kan", config=custom_config)
         text = normalize_line_endings(text or "").strip()
 
-        transliteration = preserve_format_line_by_line(text, transliterate_kannada_to_latin) if text else ""
-        translation = preserve_format_line_by_line(text, translate_kannada_to_english) if text else ""
+        transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough) if text else ""
+        translation = preserve_format_line_by_line(text, _translate_line_passthrough) if text else ""
 
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
@@ -388,8 +414,8 @@ def document():
         # Normalize so line breaks are preserved in response (e.g. two lines stay two lines)
         text = normalize_line_endings(text)
 
-        transliteration = preserve_format_line_by_line(text, transliterate_kannada_to_latin)
-        translation = preserve_format_line_by_line(text, translate_kannada_to_english)
+        transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough)
+        translation = preserve_format_line_by_line(text, _translate_line_passthrough)
 
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
@@ -416,8 +442,8 @@ def text():
         return jsonify({"error": "Missing or empty 'text' in request body"}), 400
     try:
         text = normalize_line_endings(text)
-        transliteration = preserve_format_line_by_line(text, transliterate_kannada_to_latin)
-        translation = preserve_format_line_by_line(text, translate_kannada_to_english)
+        transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough)
+        translation = preserve_format_line_by_line(text, _translate_line_passthrough)
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
             payload["user_status"] = get_user_status(user_id)

@@ -7,6 +7,6 @@
 ///   flutter build appbundle --dart-define=OCR_BASE_URL=https://your-domain.com
 const String ocrBaseUrl = String.fromEnvironment(
   'OCR_BASE_URL',
-  defaultValue: 'http://192.168.1.11:5001',
-  //defaultValue: 'https://kannada.astrostarveda.com',
+  //defaultValue: 'http://192.168.1.11:5001',
+   defaultValue: 'https://kannada.astrostarveda.com',
 );
