@@ -18,11 +18,12 @@ import 'services/auth_service.dart';
 import 'services/iap_service.dart';
 import 'services/ocr_service.dart';
 import 'package:google_mobile_ads/google_mobile_ads.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
 // Monetization: 2 free file/image uses, then upgrade. Copy & Share require upgrade.
 const int _kFreeUseLimit = 5;
 /// Max characters for typed Kannada text (translation APIs have limits; keep under ~5k).
-const int _kMaxTypedTextLength = 4500;
+const int _kMaxTypedTextLength = 2000;
 const String _kKeyFreeUseCount = 'kannada_buddy_free_use_count';
 const String _kKeyHasUpgraded = 'kannada_buddy_has_upgraded';
 const String _kKeyPurchaseToken = 'kannada_buddy_purchase_token';
@@ -44,6 +45,28 @@ const String _kUnreadableMessage =
 const String _kSubscriberQuotaMessage =
     'Your Pro subscription wasn\'t recognized. We tried to link it — please try again. '
     'If it still fails, open the Upgrade screen (from the menu) and tap Restore.';
+
+/// Typed-text input specific messages (shown in the text-box / translate flow).
+const String _kErrorEmptyTypedInput =
+    'Please enter or paste some Kannada text to translate.';
+const String _kErrorTypedTranslationNotMeaningful =
+    'We couldn\'t get a clear translation for this text. Try shorter text or split into smaller parts.';
+const String _kErrorTypedTranslationFailed =
+    'Translation failed. Check your internet connection and try again.';
+
+/// Image (gallery) specific messages.
+const String _kErrorImageUnreadable =
+    'We couldn\'t read or translate text from this image. Use a clear, well-lit photo with readable Kannada text; avoid blur, shadows, or objects covering the text.';
+const String _kErrorImageFailed =
+    'Image processing failed. Check your internet connection and try again.';
+
+/// Document specific messages.
+const String _kErrorDocumentNoPath =
+    'Could not open the selected file. Try another file.';
+const String _kErrorDocumentUnreadable =
+    'We couldn\'t read or translate this document. Try a different PDF, DOC, DOCX or TXT file with clear Kannada text.';
+const String _kErrorDocumentFailed =
+    'Document processing failed. Check your internet connection and try again.';
 
 /// Counts space-separated tokens (words) in text (language-agnostic).
 int _wordCount(String text) {
@@ -268,6 +291,15 @@ class _MyAppState extends State<MyApp> {
 
   void _onKannadaFocusChange() {
     setState(() => _showKannadaKeyboard = _kannadaFocusNode.hasFocus);
+  }
+
+  /// Sets the Kannada text box content, never exceeding [_kMaxTypedTextLength].
+  void _setKannadaText(String text) {
+    if (text.length <= _kMaxTypedTextLength) {
+      _kannadaController.text = text;
+    } else {
+      _kannadaController.text = text.substring(0, _kMaxTypedTextLength);
+    }
   }
 
   void _hideKannadaKeyboardAndClearResults() {
@@ -569,8 +601,15 @@ class _MyAppState extends State<MyApp> {
   }
 
   Future<void> _translateTypedText() async {
+    _kannadaFocusNode.unfocus();
     final text = _kannadaController.text.trim();
-    if (text.isEmpty) return;
+    if (text.isEmpty) {
+      setState(() {
+        errorMessage = _kErrorEmptyTypedInput;
+        _lastOcrErrorDetail = null;
+      });
+      return;
+    }
     if (text.length > _kMaxTypedTextLength) {
       setState(() {
         errorMessage = 'Text is too long (max $_kMaxTypedTextLength characters). Please shorten or paste in smaller parts.';
@@ -598,7 +637,7 @@ class _MyAppState extends State<MyApp> {
       _completeProgress();
       await _applyUserStatusFromResult(result);
       if (!_isTranslationMeaningful(text, result.translation)) {
-        setState(() { errorMessage = _kUnreadableMessage; _lastOcrErrorDetail = null; });
+        setState(() { errorMessage = _kErrorTypedTranslationNotMeaningful; _lastOcrErrorDetail = null; });
         return;
       }
       _kannadaController.clear();
@@ -629,7 +668,7 @@ class _MyAppState extends State<MyApp> {
         }
       } else {
         setState(() {
-          errorMessage = _kUnreadableMessage;
+          errorMessage = _kErrorTypedTranslationFailed;
           _lastOcrErrorDetail = e.toString();
         });
       }
@@ -665,16 +704,21 @@ class _MyAppState extends State<MyApp> {
       }
       return;
     }
+    final t = _kannadaController.text;
+    if (t.length >= _kMaxTypedTextLength) return;
+    final remaining = _kMaxTypedTextLength - t.length;
     if (key == 'space') {
-      _kannadaController.text += ' ';
+      _setKannadaText(t + ' ');
       return;
     }
     // Dotted-circle + ottakshara keys: insert only the ottakshara part so it combines with preceding consonant
     if (key.startsWith(_kannadaDottedCircle)) {
-      _kannadaController.text += key.substring(_kannadaDottedCircle.length);
+      final toAdd = key.substring(_kannadaDottedCircle.length);
+      _setKannadaText(t + (toAdd.length <= remaining ? toAdd : toAdd.substring(0, remaining)));
       return;
     }
-    _kannadaController.text += key;
+    final toAdd = key.length <= remaining ? key : key.substring(0, remaining);
+    _setKannadaText(t + toAdd);
   }
 
   Future<void> _processPickedFile(XFile pickedFile) async {
@@ -696,7 +740,7 @@ class _MyAppState extends State<MyApp> {
             result.translation,
             transliteration: result.transliteration,
           )) {
-        setState(() { errorMessage = _kUnreadableMessage; _lastOcrErrorDetail = null; });
+        setState(() { errorMessage = _kErrorImageUnreadable; _lastOcrErrorDetail = null; });
         return;
       }
       final uid = await authService.currentUserId();
@@ -727,7 +771,7 @@ class _MyAppState extends State<MyApp> {
         }
       } else {
         setState(() {
-          errorMessage = _kUnreadableMessage;
+          errorMessage = _kErrorImageFailed;
           _lastOcrErrorDetail = e.toString();
         });
       }
@@ -765,7 +809,7 @@ class _MyAppState extends State<MyApp> {
     if (path == null || path.isEmpty) {
       _logOcrError('document', 'Could not get file path for selected file');
       setState(() {
-        errorMessage = _kUnreadableMessage;
+        errorMessage = _kErrorDocumentNoPath;
         _lastOcrErrorDetail = 'Could not get file path for selected file';
         transliteration = '';
         translation = '';
@@ -796,7 +840,7 @@ class _MyAppState extends State<MyApp> {
             docResult.translation,
             transliteration: docResult.transliteration,
           )) {
-        setState(() { errorMessage = _kUnreadableMessage; _lastOcrErrorDetail = null; });
+        setState(() { errorMessage = _kErrorDocumentUnreadable; _lastOcrErrorDetail = null; });
         return;
       }
       final uid = await authService.currentUserId();
@@ -827,7 +871,7 @@ class _MyAppState extends State<MyApp> {
         }
       } else {
         setState(() {
-          errorMessage = _kUnreadableMessage;
+          errorMessage = _kErrorDocumentFailed;
           _lastOcrErrorDetail = e.toString();
         });
       }
@@ -1198,6 +1242,7 @@ class _MyAppState extends State<MyApp> {
                         if (upgraded == true && mounted) await _refreshUserStatusFromBackend();
                       },
                       authService: authService,
+                      ocrService: ocrService,
                       hasUpgraded: _hasUpgraded,
                       displayName: _mainDisplayName,
                       subscriptionExpiry: _subscriptionExpiry,
@@ -1339,6 +1384,7 @@ class _MyAppState extends State<MyApp> {
                     focusNode: _kannadaFocusNode,
                     readOnly: true,
                     maxLines: 3,
+                    maxLength: _kMaxTypedTextLength,
                     style: const TextStyle(fontSize: 18, height: 1.5),
                     decoration: InputDecoration(
                       hintText: 'Tap to use Kannada keyboard…',
@@ -1348,13 +1394,20 @@ class _MyAppState extends State<MyApp> {
                       ),
                       border: InputBorder.none,
                       contentPadding: const EdgeInsets.all(16),
+                      counterText: '',
                       suffixIcon: IconButton(
                         icon: const Icon(Icons.content_paste_rounded, color: Color(0xFF0D7377)),
                         tooltip: 'Paste from clipboard',
                         onPressed: () async {
                           final data = await Clipboard.getData(Clipboard.kTextPlain);
                           if (data != null && data.text != null && data.text!.isNotEmpty) {
-                            _kannadaController.text += data.text!;
+                            final current = _kannadaController.text;
+                            final remaining = _kMaxTypedTextLength - current.length;
+                            if (remaining <= 0) return;
+                            final toAdd = data.text!.length <= remaining
+                                ? data.text!
+                                : data.text!.substring(0, remaining);
+                            _setKannadaText(current + toAdd);
                           }
                         },
                       ),
@@ -1684,6 +1737,7 @@ class _InfoMenuPage extends StatelessWidget {
     this.showUpgrade = true,
     this.onUpgrade,
     this.authService,
+    this.ocrService,
     this.hasUpgraded = false,
     this.displayName,
     this.subscriptionExpiry,
@@ -1693,6 +1747,7 @@ class _InfoMenuPage extends StatelessWidget {
   final bool showUpgrade;
   final void Function(BuildContext)? onUpgrade;
   final AuthService? authService;
+  final OCRService? ocrService;
   final bool hasUpgraded;
   final String? displayName;
   final String? subscriptionExpiry;
@@ -1756,9 +1811,10 @@ class _InfoMenuPage extends StatelessWidget {
                     MaterialPageRoute<void>(
                       builder: (context) => _ProfileAccountPage(
                         authService: authService!,
+                        ocrService: ocrService,
                         isPremium: hasUpgraded,
                         initialDisplayName: displayName,
-                        subscriptionExpiry: widget.subscriptionExpiry,
+                        subscriptionExpiry: subscriptionExpiry,
                         onSignOut: onSignOut,
                       ),
                     ),
@@ -1788,6 +1844,28 @@ class _InfoMenuPage extends StatelessWidget {
               },
             );
           }),
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 24, horizontal: 16),
+            child: FutureBuilder<PackageInfo>(
+              future: PackageInfo.fromPlatform(),
+              builder: (context, snapshot) {
+                if (!snapshot.hasData) return const SizedBox.shrink();
+                final info = snapshot.data!;
+                final versionText = info.buildNumber.isNotEmpty
+                    ? '${info.version} (${info.buildNumber})'
+                    : info.version;
+                return Center(
+                  child: Text(
+                    'Version $versionText',
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: Colors.grey.shade600,
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
         ],
       ),
     );
@@ -1798,6 +1876,7 @@ class _InfoMenuPage extends StatelessWidget {
 class _ProfileAccountPage extends StatefulWidget {
   const _ProfileAccountPage({
     required this.authService,
+    this.ocrService,
     required this.isPremium,
     this.initialDisplayName,
     this.subscriptionExpiry,
@@ -1805,6 +1884,7 @@ class _ProfileAccountPage extends StatefulWidget {
   });
 
   final AuthService authService;
+  final OCRService? ocrService;
   final bool isPremium;
   final String? initialDisplayName;
   final String? subscriptionExpiry;
@@ -1817,18 +1897,33 @@ class _ProfileAccountPage extends StatefulWidget {
 class _ProfileAccountPageState extends State<_ProfileAccountPage> {
   String? _email;
   String? _displayName;
+  String? _subscriptionExpiry;
   bool _loading = true;
 
   @override
   void initState() {
     super.initState();
     _displayName = widget.initialDisplayName;
+    _subscriptionExpiry = widget.subscriptionExpiry;
     _loadDetails();
   }
 
   Future<void> _loadDetails() async {
     final email = await widget.authService.currentEmail();
     final name = widget.initialDisplayName ?? await widget.authService.currentUserName();
+    // Fetch fresh user status so we get subscription_expiry (valid until) from backend
+    if (widget.isPremium && widget.ocrService != null) {
+      final uid = await widget.authService.currentUserId();
+      if (uid != null) {
+        final status = await widget.ocrService!.getUserStatus(uid);
+        if (mounted && status != null) {
+          final expiry = status['subscription_expiry'] as String?;
+          if (expiry != null && expiry.isNotEmpty) {
+            setState(() => _subscriptionExpiry = expiry);
+          }
+        }
+      }
+    }
     if (mounted) {
       setState(() {
         _email = email;
@@ -1895,12 +1990,12 @@ class _ProfileAccountPageState extends State<_ProfileAccountPage> {
                     label: 'Subscription',
                     value: widget.isPremium ? 'Pro (active)' : 'Free',
                   ),
-                  if (widget.isPremium && widget.subscriptionExpiry != null && widget.subscriptionExpiry!.isNotEmpty) ...[
+                  if (widget.isPremium && _subscriptionExpiry != null && _subscriptionExpiry!.isNotEmpty) ...[
                     const SizedBox(height: 12),
                     _detailCard(
                       icon: Icons.event_rounded,
                       label: 'Valid until',
-                      value: _formatExpiry(widget.subscriptionExpiry!),
+                      value: _formatExpiry(_subscriptionExpiry!),
                     ),
                   ],
                   const SizedBox(height: 32),
@@ -2653,6 +2748,7 @@ class _ResultsPageState extends State<_ResultsPage> {
       fontWeight: FontWeight.w400,
       color: Color(0xFF2D3436),
     );
+    final kannadaLines = widget.kannada.split(RegExp(r'\r?\n'));
     final transliterationLines = widget.transliteration.split(RegExp(r'\r?\n'));
     final translationLines = widget.translation.split(RegExp(r'\r?\n'));
     final count = transliterationLines.length > translationLines.length
@@ -2661,6 +2757,7 @@ class _ResultsPageState extends State<_ResultsPage> {
     final entries = <Widget>[];
     final summaryParts = <String>[];
     for (int i = 0; i < count; i++) {
+      final inputKannada = i < kannadaLines.length ? kannadaLines[i].trim() : '';
       final transliterated = i < transliterationLines.length ? transliterationLines[i].trim() : '';
       final meaning = i < translationLines.length ? translationLines[i].trim() : '';
       if (transliterated.isEmpty && meaning.isEmpty) continue;
@@ -2676,6 +2773,11 @@ class _ResultsPageState extends State<_ResultsPage> {
                   height: 24,
                   thickness: 1,
                   color: const Color(0xFF0D7377).withOpacity(0.12),
+                ),
+              if (inputKannada.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(left: 4, bottom: 6),
+                  child: SelectableText(inputKannada, style: bodyStyle),
                 ),
               Padding(
                 padding: const EdgeInsets.only(left: 4),

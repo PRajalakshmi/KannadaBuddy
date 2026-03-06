@@ -96,7 +96,7 @@ def _user_status_response():
 
 
 # Kannada script Unicode range (U+0C80–U+0CFF). Lines with no Kannada are left as-is (e.g. English, numbers, URLs).
-_KANNADA_RE = re.compile(r"[\u0C80-\u0CFF]")
+_KANNADA_RE = re.compile(r"[\u0C80-\u0CFF]+")
 
 
 def _is_kannada_line(line: str) -> bool:
@@ -104,8 +104,22 @@ def _is_kannada_line(line: str) -> bool:
     return bool(_KANNADA_RE.search(line))
 
 
+def _segment_by_kannada(text: str):
+    """Split text into segments of consecutive Kannada vs non-Kannada (spaces, symbols, digits, etc.). Returns list of (is_kannada, segment_str)."""
+    if not text:
+        return []
+    # Split by Kannada runs; capturing group keeps the Kannada parts in the list (odd indices).
+    parts = re.split(r"([\u0C80-\u0CFF]+)", text)
+    result = []
+    for i, seg in enumerate(parts):
+        if not seg:
+            continue
+        result.append((i % 2 == 1, seg))
+    return result
+
+
 def transliterate_kannada_to_latin(text: str) -> str:
-    """Convert Kannada script to Latin (IAST). Non-Kannada lines are returned unchanged."""
+    """Convert Kannada script to Latin (IAST). Non-Kannada text is returned unchanged."""
     if not text or not text.strip():
         return ""
     if not _is_kannada_line(text):
@@ -118,17 +132,33 @@ def transliterate_kannada_to_latin(text: str) -> str:
 
 
 def _transliterate_line_passthrough(line: str) -> str:
-    """Transliterate only if line has Kannada; otherwise return as-is."""
+    """Transliterate only Kannada segments; leave spaces, symbols, digits, and English as-is."""
     if not line.strip():
         return ""
-    return line if not _is_kannada_line(line) else (transliterate_kannada_to_latin(line) or line)
+    if not _is_kannada_line(line):
+        return line
+    out = []
+    for is_kannada, seg in _segment_by_kannada(line):
+        if is_kannada:
+            out.append(transliterate_kannada_to_latin(seg) or seg)
+        else:
+            out.append(seg)
+    return "".join(out)
 
 
 def _translate_line_passthrough(line: str) -> str:
-    """Translate only if line has Kannada; otherwise return as-is."""
+    """Translate only Kannada segments; leave spaces, symbols, digits, and English as-is."""
     if not line.strip():
         return ""
-    return line if not _is_kannada_line(line) else (translate_kannada_to_english(line) or line)
+    if not _is_kannada_line(line):
+        return line
+    out = []
+    for is_kannada, seg in _segment_by_kannada(line):
+        if is_kannada:
+            out.append(translate_kannada_to_english(seg) or seg)
+        else:
+            out.append(seg)
+    return "".join(out)
 
 
 # Optional: preferred terms for Kannada→English (e.g. homework/school context).
