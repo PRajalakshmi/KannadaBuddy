@@ -5,6 +5,8 @@ allprojects {
     }
 }
 
+apply(from = "force-compilesdk.gradle")
+
 val newBuildDir: Directory =
     rootProject.layout.buildDirectory
         .dir("../../build")

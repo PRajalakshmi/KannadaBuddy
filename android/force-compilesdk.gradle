@@ -1,0 +1,8 @@
+// Force all Android library subprojects (e.g. printing) to compileSdk 36 so android:attr/lStar is available.
+subprojects { sub ->
+    sub.afterEvaluate {
+        if (sub.plugins.hasPlugin("com.android.library")) {
+            sub.android.compileSdkVersion 36
+        }
+    }
+}
