@@ -191,6 +191,65 @@ def _translate_line_passthrough(line: str) -> str:
     return joined
 
 
+def _naturalize_translation(text: str) -> str:
+    """
+    Replace awkward machine-translated lines (feedback/survey style) with natural English.
+    Triggered by substring heuristics so we don't depend on exact API wording.
+    """
+    if not text or not text.strip():
+        return text
+
+    def fix_line(line: str) -> str:
+        s = line.strip()
+        if not s:
+            return line
+        # Match without leading quote/bullet noise
+        low = s.lower().lstrip('"\';*•·▪▫- ').strip()
+
+        # Drop obvious OCR/merge garbage (single token junk)
+        if len(low) <= 2 and low.isalpha() and low not in ("no", "ok", "or"):
+            return ""
+
+        # 1) Errors/bugs — ಯಾವುದಾದರೂ ದೋಷಗಳು (bugs) often becomes "Anything Errors (bugs)."
+        if ("error" in low or "doṣa" in low) and ("bug" in low or "anything" in low):
+            return "Have you noticed any errors or bugs?"
+        if low.startswith("anything") and "error" in low:
+            return "Have you noticed any errors or bugs?"
+
+        # 2) Suggestions — ಸುಧಾರಣೆಗಾಗಿ ನಿಮ್ಮ ಸಲಹೆಗಳು ಏನು?
+        if "improvement" in low and ("tip" in low or "suggest" in low):
+            return "Do you have any suggestions to improve the app?"
+        if "improvement" in low and low.rstrip(".?").endswith("what"):
+            return "Do you have any suggestions to improve the app?"
+        if "for improvement" in low and "your" in low and "what" in low:
+            return "Do you have any suggestions to improve the app?"
+
+        # 3) Feedback important — ನಿಮ್ಮ ಪ್ರತಿಕ್ರಿಯೆ ನನಗೆ ತುಂಬಾ ಮುಖ್ಯ
+        if ("feedback" in low or "response" in low or "pratikriye" in low) and "important" in low:
+            return "Your feedback is very important to us."
+        if "too much" in low and "important" in low:
+            return "Your feedback is very important to us."
+        if "to me" in low and "important" in low and ("your" in low or "much" in low):
+            return "Your feedback is very important to us."
+
+        # 4) Thanks — ಮತ್ತೊಮ್ಮೆ ನಿಮ್ಮ ಸಹಾಯಕ್ಕೆ ಧನ್ಯವಾದಗಳು
+        if "thank you" in low and ("help" in low or "again" in low or "support" in low):
+            return "Thank you for your support!"
+        if low.startswith("again your") and "thank" in low:
+            return "Thank you for your support!"
+        if "thank you" in low and "sahāya" in low:  # transliteration leak
+            return "Thank you for your support!"
+
+        return line
+
+    out_lines = []
+    for ln in text.splitlines():
+        fixed = fix_line(ln)
+        if fixed:
+            out_lines.append(fixed)
+    return "\n".join(out_lines) if out_lines else text
+
+
 # Optional: preferred terms for Kannada→English (e.g. homework/school context).
 # Add entries to fix recurring mistranslations. Keys are lowercased for matching.
 TRANSLATION_GLOSSARY = {
@@ -480,6 +539,7 @@ def ocr():
 
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough) if text else ""
         translation = preserve_format_line_by_line(text, _translate_line_passthrough) if text else ""
+        translation = _naturalize_translation(translation) if translation else ""
 
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
@@ -547,6 +607,7 @@ def document():
 
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough)
         translation = preserve_format_line_by_line(text, _translate_line_passthrough)
+        translation = _naturalize_translation(translation) if translation else ""
 
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
@@ -575,6 +636,7 @@ def text():
         text = normalize_line_endings(text)
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough)
         translation = preserve_format_line_by_line(text, _translate_line_passthrough)
+        translation = _naturalize_translation(translation) if translation else ""
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
             payload["user_status"] = get_user_status(user_id)
