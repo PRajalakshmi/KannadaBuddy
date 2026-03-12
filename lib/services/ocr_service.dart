@@ -9,6 +9,21 @@ import '../models/ocr_result.dart';
 class OCRService {
   static String get _baseUrl => ocrBaseUrl;
 
+  /// Server/nginx sometimes returns HTML (502, 413, wrong path). jsonDecode then throws FormatException.
+  static void _ensureJsonBody(String body, {String context = 'Server'}) {
+    final trimmed = body.trimLeft();
+    if (trimmed.startsWith('<') ||
+        trimmed.startsWith('<!') ||
+        trimmed.toLowerCase().contains('<html')) {
+      final hint = trimmed.contains('413') || trimmed.toLowerCase().contains('large')
+          ? 'File too large for server (nginx client_max_body_size).'
+          : trimmed.contains('502') || trimmed.contains('Bad Gateway')
+              ? 'Backend unreachable (502).'
+              : 'Proxy returned a web page instead of JSON—check API URL and nginx config.';
+      throw Exception('$context: $hint');
+    }
+  }
+
   /// Headers to send with each request when user is signed in (X-User-Id).
   Map<String, String> _headers(int? userId) {
     final h = <String, String>{};
@@ -53,13 +68,16 @@ class OCRService {
       }
     }
     if (response.statusCode != 200) {
+      _ensureJsonBody(body, context: 'Document/text');
       try {
         final json = jsonDecode(body) as Map<String, dynamic>;
         throw Exception(json['error'] as String? ?? body);
-      } catch (_) {
-        throw Exception('Server error: $body');
+      } catch (e) {
+        if (e is Exception) rethrow;
+        throw Exception('Server error (${response.statusCode})');
       }
     }
+    _ensureJsonBody(body, context: 'Document/text');
     final json = jsonDecode(body) as Map<String, dynamic>;
     if (json.containsKey('error')) {
       throw Exception(json['error'] as String);
@@ -99,6 +117,7 @@ class OCRService {
     final body = await streamedResponse.stream.bytesToString();
 
     if (streamedResponse.statusCode == 403) {
+      _ensureJsonBody(body, context: 'Upload');
       try {
         final json = jsonDecode(body) as Map<String, dynamic>;
         throw Exception(json['error'] as String? ?? 'Free quota exceeded');
@@ -108,6 +127,7 @@ class OCRService {
       }
     }
     if (streamedResponse.statusCode != 200) {
+      _ensureJsonBody(body, context: 'Upload');
       // Propagate server JSON error so UI can show "use DOCX" etc. instead of generic failed.
       try {
         final json = jsonDecode(body) as Map<String, dynamic>;
@@ -116,9 +136,13 @@ class OCRService {
       } catch (e) {
         if (e is Exception) rethrow;
       }
-      throw Exception('Server error: $body');
+      throw Exception(
+        'Server error (${streamedResponse.statusCode}). '
+        'If uploading a large PDF, increase nginx client_max_body_size.',
+      );
     }
 
+    _ensureJsonBody(body, context: 'Upload');
     final json = jsonDecode(body) as Map<String, dynamic>;
     if (json.containsKey('error')) {
       throw Exception(json['error'] as String);

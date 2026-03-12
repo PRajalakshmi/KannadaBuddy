@@ -216,11 +216,38 @@ def _translate_line_whole(line: str) -> str:
     return out
 
 
+def _translate_kannada_runs_in_string(s: str) -> str:
+    """
+    Replace each contiguous Kannada run with English via kn→en. Used when mixed lines still
+    contain Kannada after passthrough (Latin guard skipped whole segment). Preserves non-Kannada.
+    """
+    if not s or not _KANNADA_RE.search(s):
+        return s
+    parts = re.split(r"([\u0C80-\u0CFF]+)", s)
+    out = []
+    for i, p in enumerate(parts):
+        if not p:
+            continue
+        if i % 2 == 1 and _KANNADA_RE.fullmatch(p):
+            try:
+                t = translate_kannada_to_english(p, append_sentence_period=False)
+                if t and t.strip() and not _KANNADA_RE.search(t):
+                    out.append(t.strip())
+                else:
+                    out.append(p)
+            except Exception:
+                out.append(p)
+        else:
+            out.append(p)
+    return "".join(out)
+
+
 def _fix_document_translation_kannada_leaks(source_text: str, translation: str) -> str:
     """
-    Whole-line translate returns source unchanged when line has Latin (translate_kannada_to_english
-    passthrough), leaving Kannada in translation. Re-run segment passthrough only for those lines
-    so mixed glossary lines become English like the image pipeline.
+    Whole-line translate returns source unchanged when line has Latin, leaving Kannada in output.
+    1) Re-run segment passthrough on source line.
+    2) If translation line still contains Kannada, translate each Kannada run in that line only
+       (so glossary lines become natural English without re-sending whole line as kn-only).
     """
     if not translation or not source_text:
         return translation or ""
@@ -232,7 +259,22 @@ def _fix_document_translation_kannada_leaks(source_text: str, translation: str) 
         if not src.strip():
             out.append(tr)
             continue
-        # If this translated line still has Kannada script, replace with segment-wise translate
+        if _KANNADA_RE.search(tr):
+            try:
+                tr = _translate_line_passthrough(src)
+            except Exception:
+                pass
+        # Second pass: any remaining Kannada in this line → translate runs only (mixed safe).
+        if _KANNADA_RE.search(tr):
+            try:
+                tr2 = _translate_kannada_runs_in_string(tr)
+                if tr2 and not _KANNADA_RE.search(tr2):
+                    tr = tr2
+                elif tr2:
+                    tr = tr2  # partial improvement
+            except Exception:
+                pass
+        # Third pass: still Kannada — try passthrough on source again (retry API).
         if _KANNADA_RE.search(tr):
             try:
                 tr = _translate_line_passthrough(src)
