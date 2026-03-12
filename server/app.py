@@ -118,17 +118,28 @@ def _segment_by_kannada(text: str):
     return result
 
 
+# Latin letters must never go through Kannada→IAST (library maps them to garbage, e.g. "bugs" → "008").
+_LATIN_LETTERS_RE = re.compile(r"[a-zA-Z]")
+
+
 def transliterate_kannada_to_latin(text: str) -> str:
     """Convert Kannada script to Latin (IAST). Non-Kannada text is returned unchanged."""
     if not text or not text.strip():
         return ""
     if not _is_kannada_line(text):
         return text.strip()
+    # Never run Kannada transliterator on strings that contain Latin; sanscript mis-maps them.
+    if _LATIN_LETTERS_RE.search(text):
+        return text.strip()
     try:
         from indic_transliteration.sanscript import transliterate
-        return transliterate(text.strip(), "kannada", "iast")
+        out = transliterate(text.strip(), "kannada", "iast")
+        # If output looks like numeric garbage and input had no digits, keep input (safety net).
+        if out and out.strip().isdigit() and not any(c.isdigit() for c in text):
+            return text.strip()
+        return out
     except Exception:
-        return ""
+        return text.strip()
 
 
 def _transliterate_line_passthrough(line: str) -> str:
@@ -140,7 +151,11 @@ def _transliterate_line_passthrough(line: str) -> str:
     out = []
     for is_kannada, seg in _segment_by_kannada(line):
         if is_kannada:
-            out.append(transliterate_kannada_to_latin(seg) or seg)
+            # Segment is a Kannada run only; still skip if Latin slipped in (defensive).
+            if _LATIN_LETTERS_RE.search(seg):
+                out.append(seg)
+            else:
+                out.append(transliterate_kannada_to_latin(seg) or seg)
         else:
             out.append(seg)
     return "".join(out)
