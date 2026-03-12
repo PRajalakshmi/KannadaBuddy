@@ -191,6 +191,31 @@ def _translate_line_passthrough(line: str) -> str:
     return joined
 
 
+def _translate_line_whole(line: str) -> str:
+    """
+    Translate an entire line in one API call. Used for /document to avoid hundreds of
+    segment calls (per-word) that timeout Gunicorn. Slightly less precise than segment
+    passthrough but completes for PDF notes like KBinputdoc (~65 lines -> ~65 calls).
+    """
+    if not line.strip():
+        return ""
+    if not _is_kannada_line(line):
+        return line
+    if _LATIN_LETTERS_RE.search(line):
+        # Mixed line: still try whole line once; API may return garbage—caller can fallback.
+        try:
+            out = translate_kannada_to_english(line, append_sentence_period=False)
+            if out and out.strip() and out.strip() != line.strip():
+                return out.strip()
+        except Exception:
+            pass
+        return line
+    out = translate_kannada_to_english(line, append_sentence_period=False) or line
+    if out and out.rstrip() and out.rstrip()[-1] not in ".!?":
+        out = out.rstrip() + "."
+    return out
+
+
 def _naturalize_translation(text: str) -> str:
     """
     Replace awkward machine-translated lines (feedback/survey style) with natural English.
@@ -693,12 +718,17 @@ def document():
         text = normalize_line_endings(text)
 
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough)
-        # Large docs trigger many translate API calls; worker timeout causes 500. Catch and degrade gracefully.
+        # Segment-by-segment translate causes hundreds of API calls and worker timeout.
+        # Whole-line translate: one call per line (e.g. 65 lines for KBinputdoc PDF).
         try:
-            translation = preserve_format_line_by_line(text, _translate_line_passthrough)
+            translation = preserve_format_line_by_line(text, _translate_line_whole)
             translation = _naturalize_translation(translation) if translation else ""
         except Exception:
-            translation = ""
+            try:
+                translation = preserve_format_line_by_line(text, _translate_line_passthrough)
+                translation = _naturalize_translation(translation) if translation else ""
+            except Exception:
+                translation = ""
 
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:

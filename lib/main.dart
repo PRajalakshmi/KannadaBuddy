@@ -840,19 +840,32 @@ class _MyAppState extends State<MyApp> {
       await _applyUserStatusFromResult(docResult);
       final text = docResult.text.trim();
       final hasText = text.isNotEmpty;
-      // PDF/doc extraction: server already produced text + translation; strict image/OCR
-      // heuristics reject glossary-style notes (high transliteration overlap). Use relaxed check.
-      final translationOk = hasText &&
-          docResult.translation.trim().isNotEmpty &&
+      final hasTranslation = docResult.translation.trim().isNotEmpty;
+      final hasTranslit = docResult.transliteration.trim().isNotEmpty;
+      // PDF/doc: server may return translation="" if translate timed out—still show text + transliteration.
+      final translationOk = hasTranslation &&
           _isTranslationMeaningful(
             text,
             docResult.translation,
             transliteration: docResult.transliteration,
             forDocument: true,
           );
-      if (!translationOk) {
+      // Accept document if we have usable text and either meaningful translation or transliteration only.
+      // Short docs: allow text-only if long enough (server may return translation later).
+      final documentOk = hasText &&
+          (translationOk ||
+              (hasTranslit && text.length >= 50) ||
+              (text.length >= 200 && text.contains(RegExp(r'[\u0C80-\u0CFF]'))));
+      if (!documentOk) {
         setState(() { errorMessage = _kErrorDocumentUnreadable; _lastOcrErrorDetail = null; });
         return;
+      }
+      if (hasText && hasTranslit && !hasTranslation && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Translation timed out—showing text and transliteration. Try shorter document or try again.'),
+          ),
+        );
       }
       final uid = await authService.currentUserId();
       if (uid == null) await _incrementLocalFreeUse();
