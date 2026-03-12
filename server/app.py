@@ -170,10 +170,17 @@ def _translate_line_passthrough(line: str) -> str:
     out = []
     for is_kannada, seg in _segment_by_kannada(line):
         if is_kannada:
-            out.append(translate_kannada_to_english(seg) or seg)
+            if _LATIN_LETTERS_RE.search(seg):
+                out.append(seg)
+            else:
+                out.append(translate_kannada_to_english(seg, append_sentence_period=False) or seg)
         else:
             out.append(seg)
-    return "".join(out)
+    joined = "".join(out)
+    # Single trailing period for the whole line (segments no longer each add ".").
+    if joined and joined.rstrip() and joined.rstrip()[-1] not in ".!?":
+        joined = joined.rstrip() + "."
+    return joined
 
 
 # Optional: preferred terms for Kannada→English (e.g. homework/school context).
@@ -191,8 +198,10 @@ def _preprocess_kannada_for_translation(text: str) -> str:
     return s.strip()
 
 
-def _fine_tune_translation(raw: str) -> str:
-    """Post-process translated text: sentence case, normalize spaces, apply glossary."""
+def _fine_tune_translation(raw: str, append_period: bool = True) -> str:
+    """Post-process translated text: sentence case, normalize spaces, apply glossary.
+    When append_period is False, no trailing dot is added (used for segment-by-segment
+    translation so we don't get 'Word. Next.' after every chunk)."""
     if not raw or not raw.strip():
         return ""
     s = " ".join(raw.strip().split())
@@ -203,7 +212,8 @@ def _fine_tune_translation(raw: str) -> str:
             s = s.replace(key.capitalize(), preferred)
     if s:
         s = s[0].upper() + s[1:]
-        if s[-1] not in ".!?":
+        # Segment-by-segment translation joins with ""; adding "." per segment causes "Word. Next.".
+        if append_period and s[-1] not in ".!?":
             s = s + "."
     return s
 
@@ -220,14 +230,16 @@ def _is_bad_translation(kannada: str, english: str) -> bool:
     return False
 
 
-def translate_kannada_to_english(text: str) -> str:
+def translate_kannada_to_english(text: str, append_sentence_period: bool = True) -> str:
     """Translate Kannada to English: try Google, fallback to MyMemory; pre/post process."""
     if not text or not text.strip():
         return ""
     inp = _preprocess_kannada_for_translation(text)
     if not inp:
         return ""
-
+    # Never send Latin/English to kn→en; APIs often return garbage (e.g. "bugs" → "008").
+    if _LATIN_LETTERS_RE.search(inp):
+        return inp.strip()
     out = None
     # 1) Try Google Translate first (best for most languages)
     try:
@@ -247,7 +259,11 @@ def translate_kannada_to_english(text: str) -> str:
     if _is_bad_translation(inp, out or ""):
         return inp  # Return original if both failed (so user sees something)
 
-    return _fine_tune_translation(out)
+    out = _fine_tune_translation(out, append_period=append_sentence_period)
+    # If API returned digit-only garbage and input had no digits, keep original.
+    if out and out.strip().isdigit() and not any(c.isdigit() for c in inp):
+        return inp.strip()
+    return out
 
 
 def normalize_line_endings(text: str) -> str:
