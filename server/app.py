@@ -206,9 +206,8 @@ def _naturalize_translation(text: str) -> str:
         # Match without leading quote/bullet noise
         low = s.lower().lstrip('"\';*•·▪▫- ').strip()
 
-        # Drop obvious OCR/merge garbage (single token junk)
-        if len(low) <= 2 and low.isalpha() and low not in ("no", "ok", "or"):
-            return ""
+        # Do not return "" here — dropping lines breaks Summary tab pairing (transliteration
+        # is line-aligned with translation by index). Junk lines keep original below.
 
         # 1) Errors/bugs — ಯಾವುದಾದರೂ ದೋಷಗಳು (bugs) often becomes "Anything Errors (bugs)."
         if ("error" in low or "doṣa" in low) and ("bug" in low or "anything" in low):
@@ -242,11 +241,11 @@ def _naturalize_translation(text: str) -> str:
 
         return line
 
+    # Must preserve exact line count and order so Flutter Summary pairs transliteration[i] with translation[i].
     out_lines = []
     for ln in text.splitlines():
         fixed = fix_line(ln)
-        if fixed:
-            out_lines.append(fixed)
+        out_lines.append(fixed if fixed else ln)
     return "\n".join(out_lines) if out_lines else text
 
 
