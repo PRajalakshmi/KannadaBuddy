@@ -175,22 +175,74 @@ _TRANSLATE_SEGMENT_CACHE_LOCK = __import__("threading").Lock()
 _TRANSLATE_SEGMENT_CACHE_MAX = 4000
 
 
+def _kannada_run_to_english_or_latin(seg: str) -> str:
+    """
+    Translate a Kannada-only run to English. If API still returns Kannada (or fails),
+    fall back to IAST transliteration so the output has no Kannada script—avoids leaked
+    letters in the translation column.
+    """
+    if not seg or not seg.strip():
+        return seg or ""
+    key = seg.strip()
+    if not _KANNADA_RE.search(key):
+        return key
+    try:
+        t = translate_kannada_to_english(key, append_sentence_period=False) or ""
+        t = (t or "").strip()
+        if t and not _KANNADA_RE.search(t):
+            return t
+    except Exception:
+        pass
+    # Retry without fine_tune (some APIs return Kannada with extra spaces/punct)
+    try:
+        from deep_translator import GoogleTranslator
+        t2 = GoogleTranslator(source="kn", target="en").translate(text=key)
+        if t2 and not _KANNADA_RE.search(t2.strip()):
+            return t2.strip()
+    except Exception:
+        pass
+    try:
+        from deep_translator import MyMemoryTranslator
+        t3 = MyMemoryTranslator(source="kn", target="en").translate(text=key)
+        if t3 and not _KANNADA_RE.search(t3.strip()):
+            return t3.strip()
+    except Exception:
+        pass
+    # Last resort: Latin transliteration (no Kannada glyphs)
+    try:
+        latin = transliterate_kannada_to_latin(key)
+        if latin and not _KANNADA_RE.search(latin):
+            return latin
+    except Exception:
+        pass
+    return key
+
+
 def _translate_segment_cached(seg: str) -> str:
-    """Translate a single Kannada-only segment; cached to avoid duplicate API calls."""
+    """Translate a single Kannada-only segment; cached only when result has no Kannada script."""
     if not seg or not seg.strip():
         return seg
     key = seg.strip()
     with _TRANSLATE_SEGMENT_CACHE_LOCK:
         if key in _TRANSLATE_SEGMENT_CACHE:
-            return _TRANSLATE_SEGMENT_CACHE[key]
+            cached = _TRANSLATE_SEGMENT_CACHE[key]
+            # Never serve cached value that still contains Kannada (stale bad API response)
+            if cached and not _KANNADA_RE.search(cached):
+                return cached
+            del _TRANSLATE_SEGMENT_CACHE[key]
     try:
         t = translate_kannada_to_english(key, append_sentence_period=False) or key
     except Exception:
         t = key
+    # If API echoed Kannada or returned garbage with Kannada, force Latin/English path
+    if t and _KANNADA_RE.search(t):
+        t = _kannada_run_to_english_or_latin(key)
     with _TRANSLATE_SEGMENT_CACHE_LOCK:
         if len(_TRANSLATE_SEGMENT_CACHE) >= _TRANSLATE_SEGMENT_CACHE_MAX:
             _TRANSLATE_SEGMENT_CACHE.clear()
-        _TRANSLATE_SEGMENT_CACHE[key] = t
+        # Only cache successful English (no Kannada script in output)
+        if t and not _KANNADA_RE.search(t):
+            _TRANSLATE_SEGMENT_CACHE[key] = t
     return t
 
 
@@ -314,9 +366,13 @@ def _translate_kannada_runs_in_string(s: str) -> str:
                 if t and t.strip() and not _KANNADA_RE.search(t):
                     out.append(t.strip())
                 else:
-                    out.append(p)
+                    # Cached/API path left Kannada — force Latin fallback
+                    out.append(_kannada_run_to_english_or_latin(p))
             except Exception:
-                out.append(p)
+                try:
+                    out.append(_kannada_run_to_english_or_latin(p))
+                except Exception:
+                    out.append(p)
         else:
             out.append(p)
     return "".join(out)
@@ -375,6 +431,40 @@ def _fix_document_translation_kannada_leaks(source_text: str, translation: str) 
             except Exception:
                 pass
         out.append(tr)
+    return "\n".join(out)
+
+
+def _strip_kannada_script_from_translation(translation: str) -> str:
+    """
+    Final pass: any remaining Kannada script in translation is replaced by English or IAST.
+    Preserves line count (line-by-line). Safe to call on full document translation payload.
+    """
+    if not translation or not _KANNADA_RE.search(translation):
+        return translation
+    lines = translation.splitlines()
+    out = []
+    for line in lines:
+        if not line.strip() or not _KANNADA_RE.search(line):
+            out.append(line)
+            continue
+        try:
+            fixed = _translate_kannada_runs_in_string(line)
+            if fixed and not _KANNADA_RE.search(fixed):
+                out.append(fixed)
+            else:
+                # Run-by-run replace still left Kannada — split and force each run
+                parts = re.split(r"([\u0C80-\u0CFF]+)", line)
+                merged = []
+                for j, p in enumerate(parts):
+                    if not p:
+                        continue
+                    if j % 2 == 1 and _KANNADA_RE.fullmatch(p):
+                        merged.append(_kannada_run_to_english_or_latin(p))
+                    else:
+                        merged.append(p)
+                out.append("".join(merged))
+        except Exception:
+            out.append(line)
     return "\n".join(out)
 
 
@@ -791,9 +881,13 @@ def ocr():
             except Exception:
                 translation = preserve_format_line_by_line(text, _translate_line_passthrough)
                 translation = _naturalize_translation(translation) if translation else ""
+            if translation:
+                translation = _strip_kannada_script_from_translation(translation)
         else:
             translation = preserve_format_line_by_line(text, _translate_line_passthrough) if text else ""
             translation = _naturalize_translation(translation) if translation else ""
+            if translation:
+                translation = _strip_kannada_script_from_translation(translation)
 
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
@@ -955,6 +1049,8 @@ def document():
                 translation = _fix_document_translation_kannada_leaks(text, translation)
             except Exception:
                 translation = ""
+        if translation:
+            translation = _strip_kannada_script_from_translation(translation)
 
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
@@ -1003,6 +1099,8 @@ def text():
                     translation = _fix_document_translation_kannada_leaks(text, translation)
             except Exception:
                 translation = ""
+        if translation:
+            translation = _strip_kannada_script_from_translation(translation)
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
             payload["user_status"] = get_user_status(user_id)
