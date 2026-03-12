@@ -7,9 +7,9 @@
    **Ubuntu / Debian:**
    ```bash
    sudo apt update
-   sudo apt install -y tesseract-ocr tesseract-ocr-kan
+   sudo apt install -y tesseract-ocr tesseract-ocr-kan tesseract-ocr-eng
    ```
-   Verify: `tesseract --version` and `tesseract --list-langs` should include `kan`.
+   Verify: `tesseract --version` and `tesseract --list-langs` should include `kan` and `eng`. **English (`eng`) is needed** for screenshots that mix Kannada with Latin in parentheses (e.g. `(bugs)`); Kannada-only OCR often misreads that as `(008)`. The server uses `kan+eng` when both are available and falls back to `kan` only if `eng` is missing.
 
    **CentOS / RHEL / Amazon Linux:**
    ```bash

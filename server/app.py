@@ -413,7 +413,16 @@ def ocr():
         img = Image.open(file.stream).convert("L")
         img = img.point(lambda x: 0 if x < 160 else 255, "1")
         custom_config = r"--psm 6"
-        text = pytesseract.image_to_string(img, lang="kan", config=custom_config)
+        # Kannada-only OCR misreads Latin in parentheses as digits, e.g. "(bugs)" → "(008)".
+        # kan+eng uses both scripts so English words are preserved. Fallback if eng not installed.
+        text = ""
+        for _lang in ("kan+eng", "kan"):
+            try:
+                text = pytesseract.image_to_string(img, lang=_lang, config=custom_config) or ""
+                if text.strip():
+                    break
+            except Exception:
+                continue
         text = normalize_line_endings(text or "").strip()
 
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough) if text else ""
