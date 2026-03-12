@@ -591,29 +591,58 @@ def _extract_pdf_text(data: bytes) -> str:
     return out
 
 
-def extract_text_from_document(data: bytes, filename: str) -> str:
-    """Extract raw text from PDF, DOCX, or TXT. Returns empty string on failure."""
+def _is_docx_zip(data: bytes) -> bool:
+    """DOCX is a ZIP; magic PK."""
+    return bool(data and len(data) >= 2 and data[:2] == b"PK")
+
+
+def _extract_docx_text(data: bytes) -> str:
     import io
-    name = filename or ""
-    ext = name.split(".")[-1].lower() if "." in name else ""
-    # Uploads may lose Unicode names or extension; detect PDF by magic bytes
-    is_pdf = ext == "pdf" or (data and data.lstrip().startswith(b"%PDF"))
     try:
-        if is_pdf:
-            return _extract_pdf_text(data)
-        if ext == "docx":
-            from docx import Document
-            doc = Document(io.BytesIO(data))
-            return "\n".join(p.text for p in doc.paragraphs).strip()
-        if ext == "doc":
-            return ""  # Old .doc not supported; use .docx
-        if ext == "txt":
+        from docx import Document
+        doc = Document(io.BytesIO(data))
+        return "\n".join(p.text for p in doc.paragraphs).strip()
+    except Exception:
+        return ""
+
+
+def extract_text_from_document(data: bytes, filename: str) -> str:
+    """Extract raw text from PDF, DOCX, or TXT. Uses magic bytes if extension missing (mobile uploads)."""
+    import io
+    if not data:
+        return ""
+    name = (filename or "").strip() or "upload"
+    ext = name.split(".")[-1].lower() if "." in name else ""
+    data_stripped = data.lstrip()
+    is_pdf = ext == "pdf" or data_stripped.startswith(b"%PDF")
+    is_docx = ext == "docx" or _is_docx_zip(data)
+
+    if is_pdf:
+        t = _extract_pdf_text(data)
+        if t:
+            return t
+    if is_docx:
+        t = _extract_docx_text(data)
+        if t:
+            return t
+    if ext == "doc":
+        return ""
+    if ext == "txt":
+        try:
+            return data.decode("utf-8", errors="replace").strip()
+        except Exception:
+            pass
+    # Unknown ext: try TXT if looks like text; else PDF/DOCX by magic
+    try:
+        sample = data[:4096]
+        if sample and (max(sample) < 0x80 or b"\x00" not in sample[:512]):
             return data.decode("utf-8", errors="replace").strip()
     except Exception:
         pass
-    # Last resort: if it looks like a PDF, try PDF extract (wrong ext after upload)
-    if data and data.lstrip().startswith(b"%PDF"):
+    if data_stripped.startswith(b"%PDF"):
         return _extract_pdf_text(data)
+    if _is_docx_zip(data):
+        return _extract_docx_text(data)
     return ""
 
 
@@ -634,21 +663,19 @@ def document():
         return jsonify({"error": "No document file part named 'document'"}), 400
 
     file = request.files["document"]
-    if file.filename == "":
-        return jsonify({"error": "Empty filename"}), 400
-
+    # Do not reject on empty filename — Android/iOS pickers often send no filename; body still valid.
     try:
         data = file.read()
         if not data:
             return jsonify({"error": "Uploaded file is empty."}), 400
-        filename = file.filename or ""
+        filename = (file.filename or "").strip() or "upload"
         ext = filename.split(".")[-1].lower() if "." in filename else ""
         # If client sends no/odd extension but body is PDF, still extract (avoid false .doc path)
-        if ext == "doc" and not data.lstrip().startswith(b"%PDF"):
+        if ext == "doc" and not data.lstrip().startswith(b"%PDF") and not data[:2] == b"PK":
             return jsonify({
                 "error": "Legacy .doc format is not supported. Open in Word/LibreOffice and save as DOCX, then try again.",
             }), 400
-        text = extract_text_from_document(data, file.filename)
+        text = extract_text_from_document(data, filename)
         if not text:
             return jsonify({
                 "error": "Could not extract text from this file. Supported: PDF, DOCX, TXT. Scanned PDFs need OCR—use a text-based PDF or paste text instead.",
