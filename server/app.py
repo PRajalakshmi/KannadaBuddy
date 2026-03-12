@@ -389,6 +389,57 @@ def user_subscription():
     return jsonify({"ok": True, "user_status": status})
 
 
+def _ocr_post_correct(text: str) -> str:
+    """
+    Tesseract often misreads Latin in parentheses next to Kannada, e.g. '(bugs)' → '(008)' or '(0೬08)'.
+    Fix known patterns when the line is clearly about errors/defects (ದೋಷ).
+    """
+    if not text:
+        return text
+
+    def fix_line(line: str) -> str:
+        # Only touch lines that mention errors/defects in Kannada (ದೋಷ = doṣa).
+        if "ದೋಷ" not in line:
+            return line
+        # Parenthetical with no Latin letters—digits/Kannada digits only—likely a misread English gloss.
+        line = re.sub(r"\([0-9೦-೯O೦೬\s]+\)", "(bugs)", line)
+        # Literal common misreads (ASCII).
+        for bad in ("(008)", "(0 0 8)", "(00 8)"):
+            if bad in line:
+                line = line.replace(bad, "(bugs)")
+        return line
+
+    return "\n".join(fix_line(ln) for ln in text.splitlines())
+
+
+def _image_to_string_multi(img, langs=("kan+eng", "kan")):
+    """
+    Run OCR with a few configs; Latin in parens is often better without harsh binarization
+    or with automatic PSM. Returns best text by heuristic (more a-z in output).
+    """
+    configs = [
+        r"--psm 6",
+        r"--psm 3",  # fully automatic; sometimes better for mixed blocks
+        r"--psm 4",  # single column variable size
+    ]
+    best_text, best_score = "", -1
+    for _lang in langs:
+        for cfg in configs:
+            try:
+                t = pytesseract.image_to_string(img, lang=_lang, config=cfg) or ""
+                if not t.strip():
+                    continue
+                # Prefer output that preserves Latin (e.g. "bugs" not all digits in parens).
+                score = sum(1 for c in t if c.isalpha() and ord(c) < 128)
+                if score > best_score:
+                    best_score, best_text = score, t
+            except Exception:
+                continue
+        if best_text.strip():
+            break
+    return best_text
+
+
 @app.route("/ocr", methods=["POST"])
 def ocr():
     user_id = _user_id_from_request()
@@ -410,20 +461,22 @@ def ocr():
         return jsonify({"error": "Empty filename"}), 400
 
     try:
-        img = Image.open(file.stream).convert("L")
-        img = img.point(lambda x: 0 if x < 160 else 255, "1")
-        custom_config = r"--psm 6"
-        # Kannada-only OCR misreads Latin in parentheses as digits, e.g. "(bugs)" → "(008)".
-        # kan+eng uses both scripts so English words are preserved. Fallback if eng not installed.
+        raw = Image.open(file.stream).convert("L")
+        # Harsh 1-bit binarization helps some Kannada but hurts Latin in parens; try grayscale first.
+        use_bin = os.environ.get("OCR_BINARIZE", "1").strip().lower() in ("1", "true", "yes")
+        candidates = []
+        if use_bin:
+            bin_img = raw.point(lambda x: 0 if x < 160 else 255, "1")
+            candidates.append(bin_img)
+        candidates.append(raw)  # grayscale often better for mixed kan+eng
+
         text = ""
-        for _lang in ("kan+eng", "kan"):
-            try:
-                text = pytesseract.image_to_string(img, lang=_lang, config=custom_config) or ""
-                if text.strip():
-                    break
-            except Exception:
-                continue
+        for img in candidates:
+            text = _image_to_string_multi(img, langs=("kan+eng", "kan"))
+            if text.strip():
+                break
         text = normalize_line_endings(text or "").strip()
+        text = _ocr_post_correct(text)
 
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough) if text else ""
         translation = preserve_format_line_by_line(text, _translate_line_passthrough) if text else ""

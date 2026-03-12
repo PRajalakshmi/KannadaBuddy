@@ -11,6 +11,11 @@
    ```
    Verify: `tesseract --version` and `tesseract --list-langs` should include `kan` and `eng`. **English (`eng`) is needed** for screenshots that mix Kannada with Latin in parentheses (e.g. `(bugs)`); Kannada-only OCR often misreads that as `(008)`. The server uses `kan+eng` when both are available and falls back to `kan` only if `eng` is missing.
 
+   If Latin in parentheses still comes out as digits (e.g. `(0೬08)`), the server:
+   - Tries **grayscale first**, then optional **binarization** (set `OCR_BINARIZE=0` to skip binarization and use grayscale only).
+   - Tries **multiple `--psm`** values (6, 3, 4) and keeps the run with more ASCII letters.
+   - **Post-corrects** lines containing `ದೋಷ` by replacing digit-only parentheticals with `(bugs)` when they’re clearly misreads.
+
    **CentOS / RHEL / Amazon Linux:**
    ```bash
    sudo yum install -y tesseract tesseract-langpack-kan
