@@ -216,6 +216,32 @@ def _translate_line_whole(line: str) -> str:
     return out
 
 
+def _fix_document_translation_kannada_leaks(source_text: str, translation: str) -> str:
+    """
+    Whole-line translate returns source unchanged when line has Latin (translate_kannada_to_english
+    passthrough), leaving Kannada in translation. Re-run segment passthrough only for those lines
+    so mixed glossary lines become English like the image pipeline.
+    """
+    if not translation or not source_text:
+        return translation or ""
+    src_lines = source_text.splitlines()
+    tr_lines = translation.splitlines()
+    out = []
+    for i, src in enumerate(src_lines):
+        tr = tr_lines[i] if i < len(tr_lines) else ""
+        if not src.strip():
+            out.append(tr)
+            continue
+        # If this translated line still has Kannada script, replace with segment-wise translate
+        if _KANNADA_RE.search(tr):
+            try:
+                tr = _translate_line_passthrough(src)
+            except Exception:
+                pass
+        out.append(tr)
+    return "\n".join(out)
+
+
 def _naturalize_translation(text: str) -> str:
     """
     Replace awkward machine-translated lines (feedback/survey style) with natural English.
@@ -723,10 +749,13 @@ def document():
         try:
             translation = preserve_format_line_by_line(text, _translate_line_whole)
             translation = _naturalize_translation(translation) if translation else ""
+            # Mixed Kannada+English lines were left as-is by whole-line path; fix like image flow.
+            translation = _fix_document_translation_kannada_leaks(text, translation)
         except Exception:
             try:
                 translation = preserve_format_line_by_line(text, _translate_line_passthrough)
                 translation = _naturalize_translation(translation) if translation else ""
+                translation = _fix_document_translation_kannada_leaks(text, translation)
             except Exception:
                 translation = ""
 
