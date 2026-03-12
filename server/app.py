@@ -297,7 +297,8 @@ def _is_bad_translation(kannada: str, english: str) -> bool:
 
 
 def translate_kannada_to_english(text: str, append_sentence_period: bool = True) -> str:
-    """Translate Kannada to English: try Google, fallback to MyMemory; pre/post process."""
+    """Translate Kannada to English: try Google, fallback to MyMemory; pre/post process.
+    Never raises: network/SSL/timeouts return original segment so document/OCR requests don't 500."""
     if not text or not text.strip():
         return ""
     inp = _preprocess_kannada_for_translation(text)
@@ -306,30 +307,34 @@ def translate_kannada_to_english(text: str, append_sentence_period: bool = True)
     # Never send Latin/English to kn→en; APIs often return garbage (e.g. "bugs" → "008").
     if _LATIN_LETTERS_RE.search(inp):
         return inp.strip()
-    out = None
-    # 1) Try Google Translate first (best for most languages)
     try:
-        from deep_translator import GoogleTranslator
-        out = GoogleTranslator(source="kn", target="en").translate(text=inp)
-    except Exception:
-        pass
-
-    # 2) Fallback to MyMemory if Google failed or returned a bad result
-    if _is_bad_translation(inp, out or ""):
+        out = None
+        # 1) Try Google Translate first (best for most languages)
         try:
-            from deep_translator import MyMemoryTranslator
-            out = MyMemoryTranslator(source="kn", target="en").translate(text=inp)
+            from deep_translator import GoogleTranslator
+            out = GoogleTranslator(source="kn", target="en").translate(text=inp)
         except Exception:
             pass
 
-    if _is_bad_translation(inp, out or ""):
-        return inp  # Return original if both failed (so user sees something)
+        # 2) Fallback to MyMemory if Google failed or returned a bad result
+        if _is_bad_translation(inp, out or ""):
+            try:
+                from deep_translator import MyMemoryTranslator
+                out = MyMemoryTranslator(source="kn", target="en").translate(text=inp)
+            except Exception:
+                pass
 
-    out = _fine_tune_translation(out, append_period=append_sentence_period)
-    # If API returned digit-only garbage and input had no digits, keep original.
-    if out and out.strip().isdigit() and not any(c.isdigit() for c in inp):
+        if _is_bad_translation(inp, out or ""):
+            return inp  # Return original if both failed (so user sees something)
+
+        out = _fine_tune_translation(out, append_period=append_sentence_period)
+        # If API returned digit-only garbage and input had no digits, keep original.
+        if out and out.strip().isdigit() and not any(c.isdigit() for c in inp):
+            return inp.strip()
+        return out
+    except Exception:
+        # Gunicorn worker timeout during requests.get can abort worker; catch any leak + always return something
         return inp.strip()
-    return out
 
 
 def normalize_line_endings(text: str) -> str:
@@ -352,7 +357,10 @@ def preserve_format_line_by_line(text: str, process_fn) -> str:
         if not stripped:
             result.append("")
             continue
-        processed = process_fn(stripped)
+        try:
+            processed = process_fn(stripped)
+        except Exception:
+            processed = stripped  # e.g. translation API timeout — keep line so document still returns 200
         result.append(processed if processed else stripped)
     return "\n".join(result)
 
@@ -685,8 +693,12 @@ def document():
         text = normalize_line_endings(text)
 
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough)
-        translation = preserve_format_line_by_line(text, _translate_line_passthrough)
-        translation = _naturalize_translation(translation) if translation else ""
+        # Large docs trigger many translate API calls; worker timeout causes 500. Catch and degrade gracefully.
+        try:
+            translation = preserve_format_line_by_line(text, _translate_line_passthrough)
+            translation = _naturalize_translation(translation) if translation else ""
+        except Exception:
+            translation = ""
 
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:

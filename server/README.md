@@ -51,6 +51,10 @@ python app.py
 
 Server will be at `http://0.0.0.0:5001`. Use your machine’s IP and this port in the Flutter app (see `lib/config/app_config.dart`).
 
+**Gunicorn timeout:** Document uploads run many translate calls; default Gunicorn timeout (30s) kills the worker and returns 500. Use a higher timeout, e.g.:
+`gunicorn --timeout 300 --bind 127.0.0.1:8001 ...`
+In systemd `ExecStart=`, add `--timeout 300` (or `120` minimum for medium PDFs).
+
 On first run, a SQLite DB file `kannada_buddy.db` is created in the server folder. It stores **users** (Google ID, email, free-use count) and **subscriptions** (user ID, purchase token, platform). All OCR/document/text requests require the **X-User-Id** header (obtained after the app signs in with Google via `POST /auth/google`). Optional: set **GOOGLE_CLIENT_ID** (e.g. Android client ID from Firebase) to verify Google ID tokens; otherwise the server accepts `google_id` + `email` in the auth request body for development.
 
 ## Running on an external server
