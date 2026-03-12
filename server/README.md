@@ -51,6 +51,8 @@ python app.py
 
 Server will be at `http://0.0.0.0:5001`. Use your machine’s IP and this port in the Flutter app (see `lib/config/app_config.dart`).
 
+**Translation speed:** Document/image translation runs many HTTP calls to Google/MyMemory. The server translates **line-by-line in parallel** (default 6 workers) to reduce wall-clock time. Tune with `TRANSLATE_PARALLEL_WORKERS=8` (or `0` to force sequential). If you hit rate limits, lower to `4`.
+
 **Gunicorn timeout:** Document uploads run many translate calls; default Gunicorn timeout (30s) kills the worker and returns 500. Use a higher timeout, e.g.:
 `gunicorn --timeout 300 --bind 127.0.0.1:8001 ...`
 In systemd `ExecStart=`, add `--timeout 300` (or `120` minimum for medium PDFs).

@@ -416,6 +416,54 @@ def preserve_format_line_by_line(text: str, process_fn) -> str:
     return "\n".join(result)
 
 
+def preserve_format_line_by_line_parallel(text: str, process_fn, max_workers: int = None) -> str:
+    """
+    Same as preserve_format_line_by_line but runs process_fn concurrently per non-empty line.
+    Speeds up document/image translation (many HTTP calls). Cap workers to avoid rate limits.
+    Set TRANSLATE_PARALLEL_WORKERS=0 to disable (use sequential).
+    """
+    if not text or not text.strip():
+        return ""
+    if os.environ.get("TRANSLATE_PARALLEL_WORKERS", "").strip() == "0":
+        return preserve_format_line_by_line(text, process_fn)
+    text = normalize_line_endings(text)
+    lines = text.splitlines()
+    n = len(lines)
+    if n <= 1:
+        return preserve_format_line_by_line(text, process_fn)
+    # Default 6 workers — balance speed vs Google/MyMemory rate limits
+    if max_workers is None:
+        max_workers = int(os.environ.get("TRANSLATE_PARALLEL_WORKERS", "6") or "6")
+    max_workers = max(2, min(max_workers, 12))
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    result = [""] * n
+
+    def work(idx: int, stripped: str):
+        try:
+            out = process_fn(stripped)
+            return idx, (out if out else stripped)
+        except Exception:
+            return idx, stripped
+
+    indexed = [(i, line.strip()) for i, line in enumerate(lines) if line.strip()]
+    if len(indexed) <= 2:
+        return preserve_format_line_by_line(text, process_fn)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(work, i, s) for i, s in indexed]
+        for fut in as_completed(futs):
+            idx, out = fut.result()
+            result[idx] = out
+    for i, line in enumerate(lines):
+        if not line.strip():
+            result[i] = ""
+        elif not result[i] and line.strip():
+            result[i] = line.strip()
+    return "\n".join(result)
+
+
 def _verify_google_id_token(id_token: str):
     """Verify Google ID token and return {"sub": google_id, "email": email, "name": name} or None."""
     if not GOOGLE_CLIENT_ID or not id_token:
@@ -596,8 +644,18 @@ def ocr():
         text = _ocr_post_correct(text)
 
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough) if text else ""
-        translation = preserve_format_line_by_line(text, _translate_line_passthrough) if text else ""
-        translation = _naturalize_translation(translation) if translation else ""
+        # Image OCR: segment-by-segment translate is very slow; whole-line + parallel like /document.
+        if text and (len(text) > 500 or text.count("\n") > 5):
+            try:
+                translation = preserve_format_line_by_line_parallel(text, _translate_line_whole)
+                translation = _naturalize_translation(translation) if translation else ""
+                translation = _fix_document_translation_kannada_leaks(text, translation)
+            except Exception:
+                translation = preserve_format_line_by_line(text, _translate_line_passthrough)
+                translation = _naturalize_translation(translation) if translation else ""
+        else:
+            translation = preserve_format_line_by_line(text, _translate_line_passthrough) if text else ""
+            translation = _naturalize_translation(translation) if translation else ""
 
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
@@ -744,16 +802,15 @@ def document():
         text = normalize_line_endings(text)
 
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough)
-        # Segment-by-segment translate causes hundreds of API calls and worker timeout.
-        # Whole-line translate: one call per line (e.g. 65 lines for KBinputdoc PDF).
+        # Whole-line translate + parallel workers — much faster than sequential segment calls.
         try:
-            translation = preserve_format_line_by_line(text, _translate_line_whole)
+            translation = preserve_format_line_by_line_parallel(text, _translate_line_whole)
             translation = _naturalize_translation(translation) if translation else ""
             # Mixed Kannada+English lines were left as-is by whole-line path; fix like image flow.
             translation = _fix_document_translation_kannada_leaks(text, translation)
         except Exception:
             try:
-                translation = preserve_format_line_by_line(text, _translate_line_passthrough)
+                translation = preserve_format_line_by_line_parallel(text, _translate_line_passthrough)
                 translation = _naturalize_translation(translation) if translation else ""
                 translation = _fix_document_translation_kannada_leaks(text, translation)
             except Exception:
@@ -785,8 +842,25 @@ def text():
     try:
         text = normalize_line_endings(text)
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough)
-        translation = preserve_format_line_by_line(text, _translate_line_passthrough)
-        translation = _naturalize_translation(translation) if translation else ""
+        # Long pasted text (e.g. 2000 chars) has many Kannada segments; per-segment translate
+        # causes hundreds of API calls → timeout / empty translation. Use whole-line path like /document.
+        use_whole_line = len(text) > 600 or text.count("\n") > 15
+        try:
+            if use_whole_line:
+                translation = preserve_format_line_by_line_parallel(text, _translate_line_whole)
+                translation = _naturalize_translation(translation) if translation else ""
+                translation = _fix_document_translation_kannada_leaks(text, translation)
+            else:
+                translation = preserve_format_line_by_line_parallel(text, _translate_line_passthrough)
+                translation = _naturalize_translation(translation) if translation else ""
+        except Exception:
+            try:
+                translation = preserve_format_line_by_line_parallel(text, _translate_line_passthrough)
+                translation = _naturalize_translation(translation) if translation else ""
+                if use_whole_line:
+                    translation = _fix_document_translation_kannada_leaks(text, translation)
+            except Exception:
+                translation = ""
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
             payload["user_status"] = get_user_status(user_id)

@@ -644,9 +644,23 @@ class _MyAppState extends State<MyApp> {
       if (!mounted) return;
       _completeProgress();
       await _applyUserStatusFromResult(result);
-      if (!_isTranslationMeaningful(text, result.translation)) {
-        setState(() { errorMessage = _kErrorTypedTranslationNotMeaningful; _lastOcrErrorDetail = null; });
-        return;
+      // Long pasted text (e.g. 2000 chars): use relaxed check; if translation empty but transliteration ok, still open Results.
+      final meaningful = _isTranslationMeaningful(
+        text,
+        result.translation,
+        transliteration: result.transliteration,
+        forDocument: text.length > 600,
+      );
+      if (!meaningful) {
+        final hasTranslit = result.transliteration.trim().isNotEmpty;
+        if (result.translation.trim().isEmpty && hasTranslit && text.length >= 100) {
+          ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+            const SnackBar(content: Text('Translation incomplete—showing transliteration. Try shorter text or try again.')),
+          );
+        } else {
+          setState(() { errorMessage = _kErrorTypedTranslationNotMeaningful; _lastOcrErrorDetail = null; });
+          return;
+        }
       }
       _kannadaController.clear();
       _navigateToResults(result.text, result.transliteration, result.translation);
