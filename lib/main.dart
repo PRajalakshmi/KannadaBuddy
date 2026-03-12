@@ -107,10 +107,14 @@ int _englishWordCount(String text) => _englishWords(text).length;
 /// not mostly Kannada, and translation word/character count is in a reasonable ratio to Kannada.
 /// [transliteration] optional: for image/doc, if provided and source is long, we require
 /// transliteration word count to be in line with source (catches bad OCR returning one run-on).
+/// [forDocument] when true, skips strict transliteration overlap checks—PDF notes often mix
+/// Kannada with short English glosses so translation tokens overlap romanized text and would
+/// otherwise be rejected despite a valid server response.
 bool _isTranslationMeaningful(
   String sourceText,
   String translation, {
   String? transliteration,
+  bool forDocument = false,
 }) {
   final t = translation.trim();
   if (t.isEmpty) return false;
@@ -137,14 +141,18 @@ bool _isTranslationMeaningful(
   }
 
   // Longer input: translation word count must be a reasonable fraction of Kannada word count.
-  final minWords = (srcWords / 3).ceil().clamp(1, 999);
+  // Documents (PDF notes) often have sparse English glosses—don't require as many English tokens.
+  final minWords = forDocument
+      ? 1
+      : (srcWords / 3).ceil().clamp(1, 999);
   if (dstWords < minWords) return false;
 
   // Long source (e.g. full page): translation must not be disproportionately short by character length.
-  if (srcLen > 300 && dstLen < srcLen / 5) return false;
+  if (!forDocument && srcLen > 300 && dstLen < srcLen / 5) return false;
 
   // For image/doc: if transliteration is provided, run strict translation-vs-transliteration checks.
-  if (transliteration != null && srcWords > 10) {
+  // Documents extracted from PDF often have glossary-style lines (Kannada + English); overlap is high.
+  if (!forDocument && transliteration != null && srcWords > 10) {
     final transLitWords = _wordCount(transliteration);
     if (transLitWords < (srcWords / 5).ceil()) return false;
 
@@ -832,14 +840,17 @@ class _MyAppState extends State<MyApp> {
       await _applyUserStatusFromResult(docResult);
       final text = docResult.text.trim();
       final hasText = text.isNotEmpty;
-      final englishWords = _englishWordCount(docResult.translation);
-      if (!hasText ||
-          englishWords < _kMinEnglishWordsForImageDoc ||
-          !_isTranslationMeaningful(
+      // PDF/doc extraction: server already produced text + translation; strict image/OCR
+      // heuristics reject glossary-style notes (high transliteration overlap). Use relaxed check.
+      final translationOk = hasText &&
+          docResult.translation.trim().isNotEmpty &&
+          _isTranslationMeaningful(
             text,
             docResult.translation,
             transliteration: docResult.transliteration,
-          )) {
+            forDocument: true,
+          );
+      if (!translationOk) {
         setState(() { errorMessage = _kErrorDocumentUnreadable; _lastOcrErrorDetail = null; });
         return;
       }
