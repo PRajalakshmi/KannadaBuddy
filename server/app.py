@@ -9,6 +9,14 @@ from flask import Flask, request, jsonify
 from PIL import Image
 import pytesseract
 
+# Linux/Unix servers usually have tesseract at /usr/bin/tesseract. Windows relies on PATH.
+# Override anytime with env: TESSERACT_CMD=/path/to/tesseract
+_tesseract_cmd = os.environ.get("TESSERACT_CMD", "").strip()
+if _tesseract_cmd and os.path.isfile(_tesseract_cmd):
+    pytesseract.pytesseract.tesseract_cmd = _tesseract_cmd
+elif os.name == "posix" and os.path.isfile("/usr/bin/tesseract"):
+    pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
+
 from db import (
     init_db,
     get_or_create_user,
