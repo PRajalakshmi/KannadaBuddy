@@ -37,6 +37,8 @@
    pip install -r requirements.txt
    ```
 
+   **PDF documents:** Text is extracted with **pypdf** first; if that returns empty or errors (some Kannada/education PDFs), **pdfminer.six** is used as fallback. Both are in `requirements.txt`—run `pip install -r requirements.txt` after pull. PDFs are also detected by magic bytes (`%PDF`) if the uploaded filename loses its `.pdf` extension.
+
 ## Run the server
 
 From the **server** folder, activate the venv then start the app:

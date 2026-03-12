@@ -551,15 +551,56 @@ def ocr():
         return jsonify({"error": str(e)}), 500
 
 
+def _extract_pdf_text(data: bytes) -> str:
+    """
+    Extract text from PDF bytes. Tries pypdf first, then pdfminer.six if empty or on error.
+    Some PDFs (e.g. certain Kannada notes) parse with one library but not the other depending
+    on server pypdf version or strict parsing.
+    """
+    import io
+    if not data or not data.lstrip().startswith(b"%PDF"):
+        return ""
+    out = ""
+    # 1) pypdf — strict=False avoids raises on slightly malformed PDFs
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(data), strict=False)
+        parts = []
+        for page in reader.pages:
+            try:
+                t = page.extract_text() or ""
+            except Exception:
+                t = ""
+            if not t.strip():
+                try:
+                    t = page.extract_text(extraction_mode="layout") or ""
+                except Exception:
+                    pass
+            parts.append(t)
+        out = "\n".join(parts).strip()
+    except Exception:
+        out = ""
+    if out:
+        return out
+    # 2) pdfminer.six — often succeeds when pypdf returns empty
+    try:
+        from pdfminer.high_level import extract_text as pdfminer_extract
+        out = (pdfminer_extract(io.BytesIO(data)) or "").strip()
+    except Exception:
+        pass
+    return out
+
+
 def extract_text_from_document(data: bytes, filename: str) -> str:
     """Extract raw text from PDF, DOCX, or TXT. Returns empty string on failure."""
     import io
-    ext = (filename or "").split(".")[-1].lower()
+    name = filename or ""
+    ext = name.split(".")[-1].lower() if "." in name else ""
+    # Uploads may lose Unicode names or extension; detect PDF by magic bytes
+    is_pdf = ext == "pdf" or (data and data.lstrip().startswith(b"%PDF"))
     try:
-        if ext == "pdf":
-            from pypdf import PdfReader
-            reader = PdfReader(io.BytesIO(data))
-            return "\n".join((page.extract_text() or "") for page in reader.pages).strip()
+        if is_pdf:
+            return _extract_pdf_text(data)
         if ext == "docx":
             from docx import Document
             doc = Document(io.BytesIO(data))
@@ -570,6 +611,9 @@ def extract_text_from_document(data: bytes, filename: str) -> str:
             return data.decode("utf-8", errors="replace").strip()
     except Exception:
         pass
+    # Last resort: if it looks like a PDF, try PDF extract (wrong ext after upload)
+    if data and data.lstrip().startswith(b"%PDF"):
+        return _extract_pdf_text(data)
     return ""
 
 
@@ -595,10 +639,19 @@ def document():
 
     try:
         data = file.read()
+        if not data:
+            return jsonify({"error": "Uploaded file is empty."}), 400
+        filename = file.filename or ""
+        ext = filename.split(".")[-1].lower() if "." in filename else ""
+        # If client sends no/odd extension but body is PDF, still extract (avoid false .doc path)
+        if ext == "doc" and not data.lstrip().startswith(b"%PDF"):
+            return jsonify({
+                "error": "Legacy .doc format is not supported. Open in Word/LibreOffice and save as DOCX, then try again.",
+            }), 400
         text = extract_text_from_document(data, file.filename)
         if not text:
             return jsonify({
-                "error": "Could not extract text from this file. Supported: PDF, DOCX, TXT.",
+                "error": "Could not extract text from this file. Supported: PDF, DOCX, TXT. Scanned PDFs need OCR—use a text-based PDF or paste text instead.",
             }), 400
 
         # Normalize so line breaks are preserved in response (e.g. two lines stay two lines)

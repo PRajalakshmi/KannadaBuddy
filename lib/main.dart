@@ -870,8 +870,17 @@ class _MyAppState extends State<MyApp> {
           await _openUpgradeFlow();
         }
       } else {
+        final msg = e.toString().toLowerCase();
+        // Server returns clear errors for empty extract, .doc, scanned PDF, etc.
+        final isExtractOrFormat = msg.contains('could not extract') ||
+            msg.contains('not supported') ||
+            msg.contains('docx') ||
+            msg.contains('empty') ||
+            msg.contains('scanned pdf');
         setState(() {
-          errorMessage = _kErrorDocumentFailed;
+          errorMessage = isExtractOrFormat
+              ? _kErrorDocumentUnreadable
+              : _kErrorDocumentFailed;
           _lastOcrErrorDetail = e.toString();
         });
       }

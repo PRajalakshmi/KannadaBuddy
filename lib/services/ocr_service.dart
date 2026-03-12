@@ -108,6 +108,14 @@ class OCRService {
       }
     }
     if (streamedResponse.statusCode != 200) {
+      // Propagate server JSON error so UI can show "use DOCX" etc. instead of generic failed.
+      try {
+        final json = jsonDecode(body) as Map<String, dynamic>;
+        final err = json['error'] as String?;
+        if (err != null && err.isNotEmpty) throw Exception(err);
+      } catch (e) {
+        if (e is Exception) rethrow;
+      }
       throw Exception('Server error: $body');
     }
 
