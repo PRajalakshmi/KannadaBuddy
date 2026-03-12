@@ -169,6 +169,31 @@ def _transliterate_line_passthrough(line: str) -> str:
     return "".join(out)
 
 
+# Cache kn→en per segment to speed PDFs with repeated words (thread-safe for parallel workers).
+_TRANSLATE_SEGMENT_CACHE = {}
+_TRANSLATE_SEGMENT_CACHE_LOCK = __import__("threading").Lock()
+_TRANSLATE_SEGMENT_CACHE_MAX = 4000
+
+
+def _translate_segment_cached(seg: str) -> str:
+    """Translate a single Kannada-only segment; cached to avoid duplicate API calls."""
+    if not seg or not seg.strip():
+        return seg
+    key = seg.strip()
+    with _TRANSLATE_SEGMENT_CACHE_LOCK:
+        if key in _TRANSLATE_SEGMENT_CACHE:
+            return _TRANSLATE_SEGMENT_CACHE[key]
+    try:
+        t = translate_kannada_to_english(key, append_sentence_period=False) or key
+    except Exception:
+        t = key
+    with _TRANSLATE_SEGMENT_CACHE_LOCK:
+        if len(_TRANSLATE_SEGMENT_CACHE) >= _TRANSLATE_SEGMENT_CACHE_MAX:
+            _TRANSLATE_SEGMENT_CACHE.clear()
+        _TRANSLATE_SEGMENT_CACHE[key] = t
+    return t
+
+
 def _translate_line_passthrough(line: str) -> str:
     """Translate only Kannada segments; leave spaces, symbols, digits, and English as-is."""
     if not line.strip():
@@ -181,11 +206,66 @@ def _translate_line_passthrough(line: str) -> str:
             if _LATIN_LETTERS_RE.search(seg):
                 out.append(seg)
             else:
-                out.append(translate_kannada_to_english(seg, append_sentence_period=False) or seg)
+                out.append(_translate_segment_cached(seg) or seg)
         else:
             out.append(seg)
     joined = "".join(out)
     # Single trailing period for the whole line (segments no longer each add ".").
+    if joined and joined.rstrip() and joined.rstrip()[-1] not in ".!?":
+        joined = joined.rstrip() + "."
+    return joined
+
+
+def _translate_line_passthrough_parallel(line: str) -> str:
+    """
+    Same output as _translate_line_passthrough but translates Kannada segments in parallel
+    within the line. Matches image OCR quality (segment-wise) without sequential API waits.
+    """
+    if not line.strip():
+        return ""
+    if not _is_kannada_line(line):
+        return line
+    segments = list(_segment_by_kannada(line))
+    # Positions in segments list that are Kannada-only (safe for kn→en)
+    to_translate = []  # (position_in_segments, seg)
+    for pos, (is_kannada, seg) in enumerate(segments):
+        if is_kannada and not _LATIN_LETTERS_RE.search(seg):
+            to_translate.append((pos, seg))
+
+    if not to_translate:
+        joined = "".join(seg for _, seg in segments)
+        if joined and joined.rstrip() and joined.rstrip()[-1] not in ".!?":
+            joined = joined.rstrip() + "."
+        return joined
+
+    seg_workers = int(os.environ.get("TRANSLATE_SEGMENT_WORKERS", "8") or "8")
+    seg_workers = max(2, min(seg_workers, 16))
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    translated_by_pos = {}
+
+    def translate_one(pos_seg):
+        pos, seg = pos_seg
+        return pos, _translate_segment_cached(seg)
+
+    if len(to_translate) == 1:
+        pos, seg = to_translate[0]
+        translated_by_pos[pos] = _translate_segment_cached(seg)
+    else:
+        with ThreadPoolExecutor(max_workers=min(seg_workers, len(to_translate))) as ex:
+            futs = [ex.submit(translate_one, item) for item in to_translate]
+            for fut in as_completed(futs):
+                pos, translated = fut.result()
+                translated_by_pos[pos] = translated
+
+    out_parts = []
+    for pos, (is_kannada, seg) in enumerate(segments):
+        if pos in translated_by_pos:
+            out_parts.append(translated_by_pos[pos])
+        else:
+            out_parts.append(seg)
+    joined = "".join(out_parts)
     if joined and joined.rstrip() and joined.rstrip()[-1] not in ".!?":
         joined = joined.rstrip() + "."
     return joined
@@ -230,7 +310,7 @@ def _translate_kannada_runs_in_string(s: str) -> str:
             continue
         if i % 2 == 1 and _KANNADA_RE.fullmatch(p):
             try:
-                t = translate_kannada_to_english(p, append_sentence_period=False)
+                t = _translate_segment_cached(p)
                 if t and t.strip() and not _KANNADA_RE.search(t):
                     out.append(t.strip())
                 else:
@@ -259,12 +339,26 @@ def _fix_document_translation_kannada_leaks(source_text: str, translation: str) 
         if not src.strip():
             out.append(tr)
             continue
+        # Cheap first pass: translate Kannada runs inside the line only (no full segment walk on source).
         if _KANNADA_RE.search(tr):
             try:
-                tr = _translate_line_passthrough(src)
+                tr2 = _translate_kannada_runs_in_string(tr)
+                if tr2 and not _KANNADA_RE.search(tr2):
+                    tr = tr2
+                elif tr2:
+                    tr = tr2
             except Exception:
                 pass
-        # Second pass: any remaining Kannada in this line → translate runs only (mixed safe).
+        # Still Kannada: full segment translate on source (parallel — same quality as image path).
+        if _KANNADA_RE.search(tr):
+            try:
+                tr = _translate_line_passthrough_parallel(src)
+            except Exception:
+                try:
+                    tr = _translate_line_passthrough(src)
+                except Exception:
+                    pass
+        # Second pass: any remaining Kannada → runs only again (mixed safe).
         if _KANNADA_RE.search(tr):
             try:
                 tr2 = _translate_kannada_runs_in_string(tr)
@@ -274,10 +368,10 @@ def _fix_document_translation_kannada_leaks(source_text: str, translation: str) 
                     tr = tr2  # partial improvement
             except Exception:
                 pass
-        # Third pass: still Kannada — try passthrough on source again (retry API).
+        # Last resort: still Kannada — parallel passthrough again (cache may help second time).
         if _KANNADA_RE.search(tr):
             try:
-                tr = _translate_line_passthrough(src)
+                tr = _translate_line_passthrough_parallel(src)
             except Exception:
                 pass
         out.append(tr)
@@ -473,10 +567,10 @@ def preserve_format_line_by_line_parallel(text: str, process_fn, max_workers: in
     n = len(lines)
     if n <= 1:
         return preserve_format_line_by_line(text, process_fn)
-    # Default 6 workers — balance speed vs Google/MyMemory rate limits
+    # Default 10 workers — document/PDF benefits from higher parallelism; cap to avoid rate limits
     if max_workers is None:
-        max_workers = int(os.environ.get("TRANSLATE_PARALLEL_WORKERS", "6") or "6")
-    max_workers = max(2, min(max_workers, 12))
+        max_workers = int(os.environ.get("TRANSLATE_PARALLEL_WORKERS", "10") or "10")
+    max_workers = max(2, min(max_workers, 16))
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -686,10 +780,12 @@ def ocr():
         text = _ocr_post_correct(text)
 
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough) if text else ""
-        # Image OCR: segment-by-segment translate is very slow; whole-line + parallel like /document.
+        # Image OCR long text: same pipeline as /document (parallel segment translate + cache).
         if text and (len(text) > 500 or text.count("\n") > 5):
             try:
-                translation = preserve_format_line_by_line_parallel(text, _translate_line_whole)
+                translation = preserve_format_line_by_line_parallel(
+                    text, _translate_line_passthrough_parallel
+                )
                 translation = _naturalize_translation(translation) if translation else ""
                 translation = _fix_document_translation_kannada_leaks(text, translation)
             except Exception:
@@ -844,11 +940,13 @@ def document():
         text = normalize_line_endings(text)
 
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough)
-        # Whole-line translate + parallel workers — much faster than sequential segment calls.
+        # Segment-wise translate (same quality as image OCR) with parallel lines + parallel segments
+        # + segment cache. Avoids whole-line path leaving Kannada when Latin is on the line.
         try:
-            translation = preserve_format_line_by_line_parallel(text, _translate_line_whole)
+            translation = preserve_format_line_by_line_parallel(
+                text, _translate_line_passthrough_parallel
+            )
             translation = _naturalize_translation(translation) if translation else ""
-            # Mixed Kannada+English lines were left as-is by whole-line path; fix like image flow.
             translation = _fix_document_translation_kannada_leaks(text, translation)
         except Exception:
             try:
@@ -886,10 +984,12 @@ def text():
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough)
         # Long pasted text (e.g. 2000 chars) has many Kannada segments; per-segment translate
         # causes hundreds of API calls → timeout / empty translation. Use whole-line path like /document.
-        use_whole_line = len(text) > 600 or text.count("\n") > 15
+        use_parallel_segments = len(text) > 400 or text.count("\n") > 10
         try:
-            if use_whole_line:
-                translation = preserve_format_line_by_line_parallel(text, _translate_line_whole)
+            if use_parallel_segments:
+                translation = preserve_format_line_by_line_parallel(
+                    text, _translate_line_passthrough_parallel
+                )
                 translation = _naturalize_translation(translation) if translation else ""
                 translation = _fix_document_translation_kannada_leaks(text, translation)
             else:
@@ -899,7 +999,7 @@ def text():
             try:
                 translation = preserve_format_line_by_line_parallel(text, _translate_line_passthrough)
                 translation = _naturalize_translation(translation) if translation else ""
-                if use_whole_line:
+                if use_parallel_segments:
                     translation = _fix_document_translation_kannada_leaks(text, translation)
             except Exception:
                 translation = ""
