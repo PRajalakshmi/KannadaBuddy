@@ -268,6 +268,27 @@ def _translate_line_passthrough(line: str) -> str:
     return joined
 
 
+def _translate_line_for_document(line: str) -> str:
+    """
+    Prefer whole-line translation for pure Kannada lines (one API call → natural sentence).
+    Mixed lines or when whole-line returns Kannada: fall back to segment-wise.
+    """
+    if not line.strip():
+        return ""
+    if not _is_kannada_line(line):
+        return line
+    # Pure Kannada: one call per line gives fluent sentences
+    if not _LATIN_LETTERS_RE.search(line):
+        try:
+            out = translate_kannada_to_english(line, append_sentence_period=True)
+            if out and out.strip() and not _KANNADA_RE.search(out):
+                return out.strip()
+        except Exception:
+            pass
+    # Mixed line or whole-line failed: segment-wise (handles Latin, no Kannada leak)
+    return _translate_line_passthrough_parallel(line)
+
+
 def _translate_line_passthrough_parallel(line: str) -> str:
     """
     Same output as _translate_line_passthrough but translates Kannada segments in parallel
@@ -529,8 +550,80 @@ def _naturalize_translation(text: str) -> str:
 # Optional: preferred terms for Kannada→English (e.g. homework/school context).
 # Add entries to fix recurring mistranslations. Keys are lowercased for matching.
 TRANSLATION_GLOSSARY = {
-    # Example: "some google output": "preferred translation",
+    "what is this": "What is this?",
+    "what is that": "What is that?",
+    "how are you": "How are you?",
+    "how is this": "How is this?",
+    "i am fine": "I am fine.",
+    "thank you": "Thank you.",
+    "please": "Please.",
+    "yes": "Yes.",
+    "no": "No.",
+    "ok": "OK.",
+    "come": "Come.",
+    "go": "Go.",
+    "see": "See.",
+    "look": "Look.",
+    "read": "Read.",
+    "write": "Write.",
+    "do it": "Do it.",
+    "do this": "Do this.",
+    "good morning": "Good morning.",
+    "good night": "Good night.",
+    "good afternoon": "Good afternoon.",
 }
+
+
+def _smooth_translation_sentences(text: str) -> str:
+    """
+    Make segment-translated lines read more naturally: merge very short fragment
+    sentences on the same line (e.g. "Word. Next." → "Word. Next." with single trailing
+    period, or join when both fragments are single words). Preserves line count.
+    """
+    if not text or not text.strip():
+        return text
+    lines = text.splitlines()
+    out = []
+    for line in lines:
+        s = line.strip()
+        if not s:
+            out.append(line)
+            continue
+        # Normalize: at most one space after period; remove ".." or ". ."
+        s = re.sub(r"\.\s*\.", ".", s)
+        s = re.sub(r"\s+", " ", s)
+        # If line has ". [A-Z]" (period space capital) and the part before period is
+        # a single word (no space), merge with next word: "Hello. World." → "Hello world."
+        parts = re.split(r"\.\s+", s)
+        if len(parts) >= 2:
+            merged = []
+            i = 0
+            while i < len(parts):
+                p = parts[i].strip()
+                if not p:
+                    i += 1
+                    continue
+                # If this part is a single word and next exists and is single word, merge
+                if (
+                    i + 1 < len(parts)
+                    and " " not in p
+                    and " " not in parts[i + 1].strip()
+                    and len(p) <= 25
+                    and len(parts[i + 1].strip()) <= 25
+                ):
+                    next_p = parts[i + 1].strip()
+                    if next_p:
+                        merged.append(p + " " + next_p[0].lower() + (next_p[1:] if len(next_p) > 1 else ""))
+                    i += 2
+                    continue
+                merged.append(p)
+                i += 1
+            if merged:
+                s = ". ".join(merged)
+                if s and s[-1] not in ".!?":
+                    s = s + "."
+        out.append(s)
+    return "\n".join(out)
 
 
 def _preprocess_kannada_for_translation(text: str) -> str:
@@ -870,13 +963,14 @@ def ocr():
         text = _ocr_post_correct(text)
 
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough) if text else ""
-        # Image OCR long text: same pipeline as /document (parallel segment translate + cache).
+        # Image OCR long text: same pipeline as /document (whole-line when pure Kannada).
         if text and (len(text) > 500 or text.count("\n") > 5):
             try:
                 translation = preserve_format_line_by_line_parallel(
-                    text, _translate_line_passthrough_parallel
+                    text, _translate_line_for_document
                 )
                 translation = _naturalize_translation(translation) if translation else ""
+                translation = _smooth_translation_sentences(translation or "")
                 translation = _fix_document_translation_kannada_leaks(text, translation)
             except Exception:
                 translation = preserve_format_line_by_line(text, _translate_line_passthrough)
@@ -1034,18 +1128,19 @@ def document():
         text = normalize_line_endings(text)
 
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough)
-        # Segment-wise translate (same quality as image OCR) with parallel lines + parallel segments
-        # + segment cache. Avoids whole-line path leaving Kannada when Latin is on the line.
+        # Prefer whole-line for pure Kannada lines (natural sentences); segment-wise for mixed.
         try:
             translation = preserve_format_line_by_line_parallel(
-                text, _translate_line_passthrough_parallel
+                text, _translate_line_for_document
             )
             translation = _naturalize_translation(translation) if translation else ""
+            translation = _smooth_translation_sentences(translation or "")
             translation = _fix_document_translation_kannada_leaks(text, translation)
         except Exception:
             try:
                 translation = preserve_format_line_by_line_parallel(text, _translate_line_passthrough)
                 translation = _naturalize_translation(translation) if translation else ""
+                translation = _smooth_translation_sentences(translation or "")
                 translation = _fix_document_translation_kannada_leaks(text, translation)
             except Exception:
                 translation = ""
@@ -1084,9 +1179,10 @@ def text():
         try:
             if use_parallel_segments:
                 translation = preserve_format_line_by_line_parallel(
-                    text, _translate_line_passthrough_parallel
+                    text, _translate_line_for_document
                 )
                 translation = _naturalize_translation(translation) if translation else ""
+                translation = _smooth_translation_sentences(translation or "")
                 translation = _fix_document_translation_kannada_leaks(text, translation)
             else:
                 translation = preserve_format_line_by_line_parallel(text, _translate_line_passthrough)
@@ -1096,6 +1192,7 @@ def text():
                 translation = preserve_format_line_by_line_parallel(text, _translate_line_passthrough)
                 translation = _naturalize_translation(translation) if translation else ""
                 if use_parallel_segments:
+                    translation = _smooth_translation_sentences(translation or "")
                     translation = _fix_document_translation_kannada_leaks(text, translation)
             except Exception:
                 translation = ""
