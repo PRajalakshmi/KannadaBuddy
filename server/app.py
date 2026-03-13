@@ -581,8 +581,9 @@ def translate_kannada_to_english(text: str, append_sentence_period: bool = True)
     inp = _preprocess_kannada_for_translation(text)
     if not inp:
         return ""
-    # Never send Latin/English to kn→en; APIs often return garbage (e.g. "bugs" → "008").
-    if _LATIN_LETTERS_RE.search(inp):
+    # Never send pure Latin/English (no Kannada) to kn→en; APIs often return garbage (e.g. "bugs" → "008").
+    # Mixed lines (Kannada + Latin) are allowed so full sentences can be translated.
+    if _LATIN_LETTERS_RE.search(inp) and not _KANNADA_RE.search(inp):
         return inp.strip()
     try:
         out = None
@@ -1034,24 +1035,19 @@ def document():
         text = normalize_line_endings(text)
 
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough)
-        # Long documents: many Kannada segments → segment-wise parallel; small docs: simpler path.
-        use_parallel_segments = len(text) > 400 or text.count("\n") > 10
         try:
-            if use_parallel_segments:
-                translation = preserve_format_line_by_line_parallel(
-                    text, _translate_line_passthrough_parallel
-                )
-                translation = _naturalize_translation(translation) if translation else ""
-                translation = _fix_document_translation_kannada_leaks(text, translation)
-            else:
-                translation = preserve_format_line_by_line_parallel(text, _translate_line_passthrough)
-                translation = _naturalize_translation(translation) if translation else ""
+            # Sentence (line) translation: translate each full line once for more natural English.
+            translation = preserve_format_line_by_line_parallel(
+                text, _translate_line_whole
+            )
+            translation = _naturalize_translation(translation) if translation else ""
+            translation = _fix_document_translation_kannada_leaks(text, translation)
         except Exception:
             try:
+                # Fallback: segment-wise translate per line if whole-line path fails.
                 translation = preserve_format_line_by_line_parallel(text, _translate_line_passthrough)
                 translation = _naturalize_translation(translation) if translation else ""
-                if use_parallel_segments:
-                    translation = _fix_document_translation_kannada_leaks(text, translation)
+                translation = _fix_document_translation_kannada_leaks(text, translation)
             except Exception:
                 translation = ""
         if translation:
