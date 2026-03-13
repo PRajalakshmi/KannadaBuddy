@@ -871,22 +871,25 @@ def ocr():
         text = _ocr_post_correct(text)
 
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough) if text else ""
-        # Image OCR long text: same pipeline as /document (parallel segment translate + cache).
+        # Image OCR long text: sentence (line) translation first, then fallback to segment-wise.
         if text and (len(text) > 500 or text.count("\n") > 5):
             try:
                 translation = preserve_format_line_by_line_parallel(
-                    text, _translate_line_passthrough_parallel
+                    text, _translate_line_whole
                 )
                 translation = _naturalize_translation(translation) if translation else ""
                 translation = _fix_document_translation_kannada_leaks(text, translation)
             except Exception:
                 translation = preserve_format_line_by_line(text, _translate_line_passthrough)
                 translation = _naturalize_translation(translation) if translation else ""
+                translation = _fix_document_translation_kannada_leaks(text, translation)
             if translation:
                 translation = _strip_kannada_script_from_translation(translation)
         else:
-            translation = preserve_format_line_by_line(text, _translate_line_passthrough) if text else ""
+            # Short image OCR: also translate per full line, for more meaningful sentences.
+            translation = preserve_format_line_by_line(text, _translate_line_whole) if text else ""
             translation = _naturalize_translation(translation) if translation else ""
+            translation = _fix_document_translation_kannada_leaks(text, translation) if translation else ""
             if translation:
                 translation = _strip_kannada_script_from_translation(translation)
 
