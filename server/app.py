@@ -875,16 +875,17 @@ def user_subscription():
     return jsonify({"ok": True, "user_status": status})
 
 
-# Kannada anusvara (U+0C82); Tesseract/OCR often misread it as ASCII '0' (e.g. ಬಂಗಾರ → ಬ0ಗಾರ).
+# Kannada anusvara (U+0C82); Tesseract/OCR often misread it as ASCII '0' or Kannada digit '೦'
+# (e.g. ಬಂಗಾರ → ಬ0ಗಾರ / ಬ೦ಗಾರ).
 _KANNADA_ANUSVARA = "\u0C82"
 
 
 def _fix_anusvara_zero(text: str) -> str:
-    """Replace ASCII '0' between two Kannada letters with anusvara ಂ (e.g. ಬ0ಗಾರ → ಬಂಗಾರ)."""
-    if not text or "0" not in text or not _KANNADA_RE.search(text):
+    """Replace '0' or '೦' (with optional spaces) between Kannada letters with anusvara ಂ."""
+    if not text or ("0" not in text and "೦" not in text) or not _KANNADA_RE.search(text):
         return text
     return re.sub(
-        r"([\u0C80-\u0CFF])0([\u0C80-\u0CFF])",
+        r"([\u0C80-\u0CFF])\s*[0೦]\s*([\u0C80-\u0CFF])",
         lambda m: m.group(1) + _KANNADA_ANUSVARA + m.group(2),
         text,
     )
