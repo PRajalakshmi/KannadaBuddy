@@ -1,5 +1,7 @@
 """
 Kannada OCR server with transliteration (Kannada -> Latin) and translation (Kannada -> English).
+Transliteration uses Latin (Roman) script with the IAST (International Alphabet of Sanskrit
+Transliteration) scheme (e.g. ā ī ū ḷ ṇ ṣ ś).
 Users sign in with Google; quota and subscription are tracked per user in SQLite.
 Run: pip install -r requirements.txt && python app.py
 """
@@ -129,9 +131,26 @@ def _segment_by_kannada(text: str):
 # Latin letters must never go through Kannada→IAST (library maps them to garbage, e.g. "bugs" → "008").
 _LATIN_LETTERS_RE = re.compile(r"[a-zA-Z]")
 
+# Transliteration output is Latin (Roman) script using IAST (International Alphabet of Sanskrit
+# Transliteration). Normalize variant characters to strict IAST so app display is consistent.
+_IAST_NORMALIZE = {
+    "\u013C": "\u1E37",   # ļ (l with cedilla) → ḷ (l with dot below)
+    "\u013B": "\u1E36",   # Ļ → Ḷ
+    "\u0142": "l",        # ł (Polish l) → l if it appears
+}
+
+
+def _normalize_to_iast(s: str) -> str:
+    """Ensure transliteration uses strict IAST (Latin script). Replaces known variants."""
+    if not s:
+        return s
+    for variant, iast in _IAST_NORMALIZE.items():
+        s = s.replace(variant, iast)
+    return s
+
 
 def transliterate_kannada_to_latin(text: str) -> str:
-    """Convert Kannada script to Latin (IAST). Non-Kannada text is returned unchanged."""
+    """Convert Kannada script to Latin (Roman) using IAST. Non-Kannada text is returned unchanged."""
     if not text or not text.strip():
         return ""
     if not _is_kannada_line(text):
@@ -145,7 +164,7 @@ def transliterate_kannada_to_latin(text: str) -> str:
         # If output looks like numeric garbage and input had no digits, keep input (safety net).
         if out and out.strip().isdigit() and not any(c.isdigit() for c in text):
             return text.strip()
-        return out
+        return _normalize_to_iast(out) if out else out
     except Exception:
         return text.strip()
 
@@ -533,6 +552,81 @@ TRANSLATION_GLOSSARY = {
 }
 
 
+# Trained sentences/words: exact Kannada line → correct transliteration (IAST) and English.
+# Keys are normalized (strip); add entries from curriculum so app shows these instead of API output.
+CUSTOM_TRANSLITERATION_LINES = {
+    "ಪದಗಳ ಅರ್ಥ ತಿಳಿಯಿರಿ :": "padagaḷa artha tiḷiyiri :",
+    "ಪದಗಳ ಅರ್ಥ ತಿಳಿಯಿರಿ:": "padagaḷa artha tiḷiyiri:",
+    "ಹೊಂದಿಸಿ ಬರೆಯಿರಿ.": "hondisi bareyiri.",
+    "ಬಿಡಿಸಿ ಬರೆಯಿರಿ.": "bidisi bareyiri.",
+    "ವಿರುದ್ಧ ಪದಗಳು:": "viruddha padagaḷu:",
+    "ಒಂದು ವಾಕ್ಯದಲ್ಲಿ ಉತ್ತರಿಸಿ.": "ondu vākyadalli uttarisiri.",
+    "ಈ ಮಾತುಗಳನ್ನು ಯಾರು ಯಾರಿಗೆ ಹೇಳಿದರು?": "ī mātugaḷannu yāru yārige hēḷidaru?",
+    "ಪದಗಳ": "padagaḷa",
+    "ಅರ್ಥ": "artha",
+    "ತಿಳಿಯಿರಿ": "tiḷiyiri",
+    "ಹೊಂದಿಸಿ": "hondisi",
+    "ಬರೆಯಿರಿ": "bareyiri",
+    "ಬಿಡಿಸಿ": "bidisi",
+    "ವಿರುದ್ಧ": "viruddha",
+    "ಪದಗಳು": "padagaḷu",
+    "ಒಂದು": "ondu",
+    "ವಾಕ್ಯದಲ್ಲಿ": "vākyadalli",
+    "ಉತ್ತರಿಸಿ": "uttarisiri",
+    "ಈ": "ī",
+    "ಮಾತುಗಳನ್ನು": "mātugaḷannu",
+    "ಯಾರು": "yāru",
+    "ಯಾರಿಗೆ": "yārige",
+    "ಹೇಳಿದರು": "hēḷidaru",
+}
+
+CUSTOM_TRANSLATION_LINES = {
+    "ಪದಗಳ ಅರ್ಥ ತಿಳಿಯಿರಿ :": "Understand the meanings of the words.",
+    "ಪದಗಳ ಅರ್ಥ ತಿಳಿಯಿರಿ:": "Understand the meanings of the words.",
+    "ಹೊಂದಿಸಿ ಬರೆಯಿರಿ.": "Match and write.",
+    "ಬಿಡಿಸಿ ಬರೆಯಿರಿ.": "Separate and write.",
+    "ವಿರುದ್ಧ ಪದಗಳು:": "Opposite words.",
+    "ಒಂದು ವಾಕ್ಯದಲ್ಲಿ ಉತ್ತರಿಸಿ.": "Answer in one sentence.",
+    "ಈ ಮಾತುಗಳನ್ನು ಯಾರು ಯಾರಿಗೆ ಹೇಳಿದರು?": "Who said these words to whom?",
+    "ಪದಗಳ": "of words",
+    "ಅರ್ಥ": "meaning",
+    "ತಿಳಿಯಿರಿ": "understand / learn",
+    "ಹೊಂದಿಸಿ": "match / pair",
+    "ಬರೆಯಿರಿ": "write",
+    "ಬಿಡಿಸಿ": "separate / split",
+    "ವಿರುದ್ಧ": "opposite",
+    "ಪದಗಳು": "words",
+    "ಒಂದು": "one",
+    "ವಾಕ್ಯದಲ್ಲಿ": "in a sentence",
+    "ಉತ್ತರಿಸಿ": "answer",
+    "ಈ": "these",
+    "ಮಾತುಗಳನ್ನು": "words / sentences",
+    "ಯಾರು": "who",
+    "ಯಾರಿಗೆ": "to whom",
+    "ಹೇಳಿದರು": "said / told",
+}
+
+
+def _apply_custom_line_overrides(
+    source_text: str, result_text: str, override_map: dict
+) -> str:
+    """Replace result lines with trained overrides when source line matches. Preserves line count."""
+    if not source_text or not result_text or not override_map:
+        return result_text
+    src_lines = source_text.splitlines()
+    res_lines = result_text.splitlines()
+    out = []
+    for i, src in enumerate(src_lines):
+        key = src.strip()
+        if key in override_map:
+            out.append(override_map[key])
+        elif i < len(res_lines):
+            out.append(res_lines[i])
+        else:
+            out.append("")
+    return "\n".join(out)
+
+
 def _preprocess_kannada_for_translation(text: str) -> str:
     """Clean Kannada text before sending to translator for better results."""
     if not text:
@@ -871,6 +965,9 @@ def ocr():
         text = _ocr_post_correct(text)
 
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough) if text else ""
+        if transliteration:
+            transliteration = _apply_custom_line_overrides(text, transliteration, CUSTOM_TRANSLITERATION_LINES)
+            transliteration = _normalize_to_iast(transliteration)
         # Image OCR long text: sentence (line) translation first, then fallback to segment-wise.
         if text and (len(text) > 500 or text.count("\n") > 5):
             try:
@@ -892,6 +989,8 @@ def ocr():
             translation = _fix_document_translation_kannada_leaks(text, translation) if translation else ""
             if translation:
                 translation = _strip_kannada_script_from_translation(translation)
+        if translation:
+            translation = _apply_custom_line_overrides(text, translation, CUSTOM_TRANSLATION_LINES)
 
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
@@ -1038,6 +1137,9 @@ def document():
         text = normalize_line_endings(text)
 
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough)
+        if transliteration:
+            transliteration = _apply_custom_line_overrides(text, transliteration, CUSTOM_TRANSLITERATION_LINES)
+            transliteration = _normalize_to_iast(transliteration)
         try:
             # Sentence (line) translation: translate each full line once for more natural English.
             translation = preserve_format_line_by_line_parallel(
@@ -1055,6 +1157,8 @@ def document():
                 translation = ""
         if translation:
             translation = _strip_kannada_script_from_translation(translation)
+        if translation:
+            translation = _apply_custom_line_overrides(text, translation, CUSTOM_TRANSLATION_LINES)
 
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
@@ -1082,6 +1186,9 @@ def text():
     try:
         text = normalize_line_endings(text)
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough)
+        if transliteration:
+            transliteration = _apply_custom_line_overrides(text, transliteration, CUSTOM_TRANSLITERATION_LINES)
+            transliteration = _normalize_to_iast(transliteration)
         # Long pasted text (e.g. 2000 chars) has many Kannada segments; per-segment translate
         # causes hundreds of API calls → timeout / empty translation. Use whole-line path like /document.
         use_parallel_segments = len(text) > 400 or text.count("\n") > 10
@@ -1105,6 +1212,8 @@ def text():
                 translation = ""
         if translation:
             translation = _strip_kannada_script_from_translation(translation)
+        if translation:
+            translation = _apply_custom_line_overrides(text, translation, CUSTOM_TRANSLATION_LINES)
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
             payload["user_status"] = get_user_status(user_id)
