@@ -875,15 +875,31 @@ def user_subscription():
     return jsonify({"ok": True, "user_status": status})
 
 
+# Kannada anusvara (U+0C82); Tesseract/OCR often misread it as ASCII '0' (e.g. ಬಂಗಾರ → ಬ0ಗಾರ).
+_KANNADA_ANUSVARA = "\u0C82"
+
+
+def _fix_anusvara_zero(text: str) -> str:
+    """Replace ASCII '0' between two Kannada letters with anusvara ಂ (e.g. ಬ0ಗಾರ → ಬಂಗಾರ)."""
+    if not text or "0" not in text or not _KANNADA_RE.search(text):
+        return text
+    return re.sub(
+        r"([\u0C80-\u0CFF])0([\u0C80-\u0CFF])",
+        lambda m: m.group(1) + _KANNADA_ANUSVARA + m.group(2),
+        text,
+    )
+
+
 def _ocr_post_correct(text: str) -> str:
     """
     Tesseract often misreads Latin in parentheses next to Kannada, e.g. '(bugs)' → '(008)' or '(0೬08)'.
-    Fix known patterns when the line is clearly about errors/defects (ದೋಷ).
+    It also misreads Kannada anusvara (ಂ) as digit 0 (e.g. ಬಂಗಾರ → ಬ0ಗಾರ). Fix known patterns.
     """
     if not text:
         return text
 
     def fix_line(line: str) -> str:
+        line = _fix_anusvara_zero(line)
         # Only touch lines that mention errors/defects in Kannada (ದೋಷ = doṣa).
         if "ದೋಷ" not in line:
             return line
@@ -1135,6 +1151,7 @@ def document():
 
         # Normalize so line breaks are preserved in response (e.g. two lines stay two lines)
         text = normalize_line_endings(text)
+        text = _fix_anusvara_zero(text)
 
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough)
         if transliteration:
@@ -1185,6 +1202,7 @@ def text():
         return jsonify({"error": "Missing or empty 'text' in request body"}), 400
     try:
         text = normalize_line_endings(text)
+        text = _fix_anusvara_zero(text)
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough)
         if transliteration:
             transliteration = _apply_custom_line_overrides(text, transliteration, CUSTOM_TRANSLITERATION_LINES)
