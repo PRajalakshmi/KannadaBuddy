@@ -1005,18 +1005,18 @@ def ocr():
                 translation = preserve_format_line_by_line_parallel(
                     text, _translate_line_whole
                 )
-                translation = _naturalize_translation(translation) if translation else ""
+                # translation = _naturalize_translation(translation) if translation else ""  # disabled for now
                 translation = _fix_document_translation_kannada_leaks(text, translation)
             except Exception:
                 translation = preserve_format_line_by_line(text, _translate_line_passthrough)
-                translation = _naturalize_translation(translation) if translation else ""
+                # translation = _naturalize_translation(translation) if translation else ""  # disabled for now
                 translation = _fix_document_translation_kannada_leaks(text, translation)
             if translation:
                 translation = _strip_kannada_script_from_translation(translation)
         else:
             # Short image OCR: also translate per full line, for more meaningful sentences.
             translation = preserve_format_line_by_line(text, _translate_line_whole) if text else ""
-            translation = _naturalize_translation(translation) if translation else ""
+            # translation = _naturalize_translation(translation) if translation else ""  # disabled for now
             translation = _fix_document_translation_kannada_leaks(text, translation) if translation else ""
             if translation:
                 translation = _strip_kannada_script_from_translation(translation)
@@ -1177,13 +1177,13 @@ def document():
             translation = preserve_format_line_by_line_parallel(
                 text, _translate_line_whole
             )
-            translation = _naturalize_translation(translation) if translation else ""
+            # translation = _naturalize_translation(translation) if translation else ""  # disabled for now
             translation = _fix_document_translation_kannada_leaks(text, translation)
         except Exception:
             try:
                 # Fallback: segment-wise translate per line if whole-line path fails.
                 translation = preserve_format_line_by_line_parallel(text, _translate_line_passthrough)
-                translation = _naturalize_translation(translation) if translation else ""
+                # translation = _naturalize_translation(translation) if translation else ""  # disabled for now
                 translation = _fix_document_translation_kannada_leaks(text, translation)
             except Exception:
                 translation = ""
@@ -1230,15 +1230,15 @@ def text():
                 translation = preserve_format_line_by_line_parallel(
                     text, _translate_line_passthrough_parallel
                 )
-                translation = _naturalize_translation(translation) if translation else ""
+                # translation = _naturalize_translation(translation) if translation else ""  # disabled for now
                 translation = _fix_document_translation_kannada_leaks(text, translation)
             else:
                 translation = preserve_format_line_by_line_parallel(text, _translate_line_passthrough)
-                translation = _naturalize_translation(translation) if translation else ""
+                # translation = _naturalize_translation(translation) if translation else ""  # disabled for now
         except Exception:
             try:
                 translation = preserve_format_line_by_line_parallel(text, _translate_line_passthrough)
-                translation = _naturalize_translation(translation) if translation else ""
+                # translation = _naturalize_translation(translation) if translation else ""  # disabled for now
                 if use_parallel_segments:
                     translation = _fix_document_translation_kannada_leaks(text, translation)
             except Exception:
