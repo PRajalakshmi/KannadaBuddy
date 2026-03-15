@@ -607,6 +607,20 @@ CUSTOM_TRANSLATION_LINES = {
 }
 
 
+def _override_lookup(line: str, override_map: dict):
+    """Exact match first; then match ignoring trailing . or : so OCR and document line up."""
+    k = line.strip()
+    if k in override_map:
+        return override_map[k]
+    k_norm = k.rstrip(".:")
+    if not k_norm:
+        return None
+    for key, value in override_map.items():
+        if key.rstrip(".:") == k_norm:
+            return value
+    return None
+
+
 def _apply_custom_line_overrides(
     source_text: str, result_text: str, override_map: dict
 ) -> str:
@@ -617,9 +631,9 @@ def _apply_custom_line_overrides(
     res_lines = result_text.splitlines()
     out = []
     for i, src in enumerate(src_lines):
-        key = src.strip()
-        if key in override_map:
-            out.append(override_map[key])
+        override = _override_lookup(src, override_map)
+        if override is not None:
+            out.append(override)
         elif i < len(res_lines):
             out.append(res_lines[i])
         else:
