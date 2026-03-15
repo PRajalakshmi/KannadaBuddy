@@ -607,16 +607,23 @@ CUSTOM_TRANSLATION_LINES = {
 }
 
 
+def _normalize_line_for_override(s: str) -> str:
+    """Single spaces, strip, no trailing . or : so document and OCR lines match same override."""
+    if not s:
+        return ""
+    return " ".join(s.strip().split()).strip().rstrip(".:").strip()
+
+
 def _override_lookup(line: str, override_map: dict):
-    """Exact match first; then match ignoring trailing . or : so OCR and document line up."""
+    """Exact match first; then normalized match (spaces + trailing .:) so document and image align."""
     k = line.strip()
     if k in override_map:
         return override_map[k]
-    k_norm = k.rstrip(".:")
+    k_norm = _normalize_line_for_override(k)
     if not k_norm:
         return None
     for key, value in override_map.items():
-        if key.rstrip(".:") == k_norm:
+        if _normalize_line_for_override(key) == k_norm:
             return value
     return None
 
