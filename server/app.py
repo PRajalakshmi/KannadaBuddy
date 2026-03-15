@@ -7,6 +7,7 @@ Run: pip install -r requirements.txt && python app.py
 """
 import os
 import re
+from typing import Optional
 from flask import Flask, request, jsonify
 from PIL import Image
 import pytesseract
@@ -484,6 +485,52 @@ def _strip_kannada_script_from_translation(translation: str) -> str:
                 out.append("".join(merged))
         except Exception:
             out.append(line)
+    return "\n".join(out)
+
+
+def _final_decode_other_language(translation: str, source_text: Optional[str] = None) -> str:
+    """
+    At the end of translation: if a line contains any ASCII (English) and also non-ASCII
+    (Kannada or other script), decode those other-language runs to English/Latin by
+    comparing with the input (source) line when available.
+    """
+    if not translation or not translation.strip():
+        return translation
+    lines = translation.splitlines()
+    src_lines = (source_text or "").splitlines() if source_text else []
+    out = []
+    for i, line in enumerate(lines):
+        if not line.strip():
+            out.append(line)
+            continue
+        has_ascii = any(ord(c) < 128 for c in line)
+        if not has_ascii:
+            out.append(line)
+            continue
+        if not _KANNADA_RE.search(line):
+            out.append(line)
+            continue
+        source_line = src_lines[i] if i < len(src_lines) else ""
+        try:
+            parts = re.split(r"([\u0C80-\u0CFF]+)", line)
+            merged = []
+            for j, p in enumerate(parts):
+                if not p:
+                    continue
+                if j % 2 == 1 and _KANNADA_RE.fullmatch(p):
+                    # Prefer decoding using the same run from source when present (canonical form)
+                    to_decode = p.strip() if (source_line and p.strip() in source_line) else p
+                    decoded = _kannada_run_to_english_or_latin(to_decode)
+                    merged.append(decoded)
+                else:
+                    merged.append(p)
+            out.append("".join(merged))
+        except Exception:
+            try:
+                fixed = _translate_kannada_runs_in_string(line)
+                out.append(fixed if fixed else line)
+            except Exception:
+                out.append(line)
     return "\n".join(out)
 
 
@@ -986,13 +1033,25 @@ def ocr():
 
     try:
         raw = Image.open(file.stream).convert("L")
-        # Harsh 1-bit binarization helps some Kannada but hurts Latin in parens; try grayscale first.
-        use_bin = os.environ.get("OCR_BINARIZE", "1").strip().lower() in ("1", "true", "yes")
+        # Build candidate images: high-contrast B&W first (best for many docs), then optional binarize, then grayscale.
         candidates = []
+        try:
+            from PIL import ImageEnhance
+            contrast = float(os.environ.get("OCR_CONTRAST", "2.0").strip() or "2.0")
+            contrast = max(1.0, min(4.0, contrast))
+            high_contrast = ImageEnhance.Contrast(raw).enhance(contrast)
+            # Convert to strict black/white for OCR (threshold 128; env OCR_BW_THRESHOLD overrides).
+            thresh = int(os.environ.get("OCR_BW_THRESHOLD", "128").strip() or "128")
+            thresh = max(1, min(254, thresh))
+            bw_img = high_contrast.point(lambda x: 0 if x < thresh else 255, "1")
+            candidates.append(bw_img)
+        except Exception:
+            pass
+        use_bin = os.environ.get("OCR_BINARIZE", "1").strip().lower() in ("1", "true", "yes")
         if use_bin:
             bin_img = raw.point(lambda x: 0 if x < 160 else 255, "1")
             candidates.append(bin_img)
-        candidates.append(raw)  # grayscale often better for mixed kan+eng
+        candidates.append(raw)  # grayscale fallback for mixed kan+eng
 
         text = ""
         for img in candidates:
@@ -1029,6 +1088,7 @@ def ocr():
                 translation = _strip_kannada_script_from_translation(translation)
         if translation:
             translation = _apply_custom_line_overrides(text, translation, CUSTOM_TRANSLATION_LINES)
+            translation = _final_decode_other_language(translation, text)
 
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
@@ -1198,6 +1258,7 @@ def document():
             translation = _strip_kannada_script_from_translation(translation)
         if translation:
             translation = _apply_custom_line_overrides(text, translation, CUSTOM_TRANSLATION_LINES)
+            translation = _final_decode_other_language(translation, text)
 
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
@@ -1254,6 +1315,7 @@ def text():
             translation = _strip_kannada_script_from_translation(translation)
         if translation:
             translation = _apply_custom_line_overrides(text, translation, CUSTOM_TRANSLATION_LINES)
+            translation = _final_decode_other_language(translation, text)
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
             payload["user_status"] = get_user_status(user_id)
