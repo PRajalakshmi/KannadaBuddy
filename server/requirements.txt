@@ -2,6 +2,7 @@ Flask==3.0.2
 Pillow==10.3.0
 pytesseract==0.3.10
 indic-transliteration>=2.3.59
+indic-nlp-library>=0.92
 deep-translator>=1.11.4
 pypdf>=4.0.0
 pdfminer.six>=20221105

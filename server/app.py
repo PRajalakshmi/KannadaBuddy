@@ -109,10 +109,33 @@ def _user_status_response():
 # Kannada script Unicode range (U+0C80–U+0CFF). Lines with no Kannada are left as-is (e.g. English, numbers, URLs).
 _KANNADA_RE = re.compile(r"[\u0C80-\u0CFF]+")
 
+# Numbering-only lines: short or pure Roman numerals/digits like "2", "IV", "10".
+_NUMBERING_ONLY_RE = re.compile(r"^[0-9IVXivx]+$")
+
 
 def _is_kannada_line(line: str) -> bool:
     """True if the line contains Kannada script; otherwise treat as English/non-Kannada and pass through unchanged."""
     return bool(_KANNADA_RE.search(line))
+
+
+def _is_numbering_only_line(text: str) -> bool:
+    """
+    Detect pure numbering headers like "2", "IV", "10".
+    Mirrors: if (text.length < 3) return ""; if (/^[0-9IVX]+$/).
+    """
+    if not text:
+        return True
+    s = text.strip()
+    if not s:
+        return True
+    # Never treat Kannada text as numbering-only (short Kannada words like "ಮಾ" must not be dropped).
+    if _KANNADA_RE.search(s):
+        return False
+    if len(s) < 3:
+        return True
+    if _NUMBERING_ONLY_RE.fullmatch(s):
+        return True
+    return False
 
 
 def _segment_by_kannada(text: str):
@@ -171,8 +194,11 @@ def transliterate_kannada_to_latin(text: str) -> str:
 
 
 def _transliterate_line_passthrough(line: str) -> str:
-    """Transliterate only Kannada segments; leave spaces, symbols, digits, and English as-is."""
+    """Transliterate only Kannada segments; drop obvious OCR garbage, preserve meaningful non-Kannada."""
     if not line.strip():
+        return ""
+    # Skip pure numbering lines like "2", "IV", "10" in transliteration/translation views.
+    if _is_numbering_only_line(line):
         return ""
     if not _is_kannada_line(line):
         return line
@@ -185,7 +211,15 @@ def _transliterate_line_passthrough(line: str) -> str:
             else:
                 out.append(transliterate_kannada_to_latin(seg) or seg)
         else:
-            out.append(seg)
+            # Non-Kannada: keep spaces/real text, but drop pure garbage blobs (€, bullets, etc.).
+            s = seg
+            if not s.strip():
+                out.append(s)
+            # Drop short, symbol-only blobs (no letters or digits), e.g. "€ x :" parts from OCR.
+            elif not re.search(r"[A-Za-z0-9]", s) and re.search(r"[\u00B7\u2022\u2023\u25E6\u2219\u00B0\u00A2-\u00A5\u20A0-\u20CF€]", s):
+                continue
+            else:
+                out.append(s)
     return "".join(out)
 
 
@@ -266,8 +300,127 @@ def _translate_segment_cached(seg: str) -> str:
     return t
 
 
+def _segment_into_phrases(segments: list) -> list:
+    """
+    Group segments into phrase runs: consecutive Kannada with only space/punct between
+    become one phrase. Returns list of ("text", s) or ("phrase", s).
+    """
+    items = []
+    i = 0
+    while i < len(segments):
+        is_k, seg = segments[i]
+        if not is_k:
+            items.append(("text", seg))
+            i += 1
+            continue
+        parts = []
+        while i < len(segments):
+            is_k, seg = segments[i]
+            if is_k:
+                parts.append(seg)
+                i += 1
+            else:
+                if seg.strip():
+                    break
+                parts.append(seg)
+                i += 1
+        if parts:
+            items.append(("phrase", "".join(parts)))
+    return items
+
+
+def _translate_phrase_cached(phrase: str) -> str:
+    """Translate a Kannada phrase (one or more words); cached when result is clean."""
+    if not phrase or not phrase.strip():
+        return phrase
+    key = phrase.strip()
+    with _TRANSLATE_SEGMENT_CACHE_LOCK:
+        if key in _TRANSLATE_SEGMENT_CACHE:
+            cached = _TRANSLATE_SEGMENT_CACHE[key]
+            if cached and not _KANNADA_RE.search(cached):
+                return cached
+            del _TRANSLATE_SEGMENT_CACHE[key]
+    try:
+        t = translate_kannada_to_english(key, append_sentence_period=False) or key
+    except Exception:
+        t = key
+    if t and _KANNADA_RE.search(t):
+        t = _kannada_run_to_english_or_latin(key)
+    with _TRANSLATE_SEGMENT_CACHE_LOCK:
+        if len(_TRANSLATE_SEGMENT_CACHE) >= _TRANSLATE_SEGMENT_CACHE_MAX:
+            _TRANSLATE_SEGMENT_CACHE.clear()
+        if t and not _KANNADA_RE.search(t):
+            _TRANSLATE_SEGMENT_CACHE[key] = t
+    return t
+
+
+def _translate_line_phrase(line: str) -> str:
+    """Translate at phrase level: group consecutive Kannada (with spaces) into phrases, translate each phrase."""
+    if not line.strip():
+        return ""
+    if _is_numbering_only_line(line):
+        return ""
+    if not _is_kannada_line(line):
+        return line
+    segments = list(_segment_by_kannada(line))
+    items = _segment_into_phrases(segments)
+    out = []
+    for kind, s in items:
+        if kind == "text":
+            out.append(s)
+        else:
+            if _LATIN_LETTERS_RE.search(s):
+                out.append(s)
+            else:
+                out.append(_translate_phrase_cached(s) or s)
+    joined = "".join(out)
+    if joined and joined.rstrip() and joined.rstrip()[-1] not in ".!?":
+        joined = joined.rstrip() + "."
+    return joined
+
+
+def _translate_line_phrase_parallel(line: str) -> str:
+    """Phrase translation with parallel API calls for each phrase."""
+    if not line.strip():
+        return ""
+    if _is_numbering_only_line(line):
+        return ""
+    if not _is_kannada_line(line):
+        return line
+    segments = list(_segment_by_kannada(line))
+    items = _segment_into_phrases(segments)
+    phrase_items = [(i, s) for i, (kind, s) in enumerate(items) if kind == "phrase" and not _LATIN_LETTERS_RE.search(s)]
+    if not phrase_items:
+        joined = "".join(s for _, s in items)
+        if joined and joined.rstrip() and joined.rstrip()[-1] not in ".!?":
+            joined = joined.rstrip() + "."
+        return joined
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    workers = max(2, min(16, int(os.environ.get("TRANSLATE_SEGMENT_WORKERS", "8") or "8")))
+    translated = {}
+    if len(phrase_items) == 1:
+        idx, phrase = phrase_items[0]
+        translated[idx] = _translate_phrase_cached(phrase)
+    else:
+        with ThreadPoolExecutor(max_workers=min(workers, len(phrase_items))) as ex:
+            futs = {ex.submit(lambda i_ph: (i_ph[0], _translate_phrase_cached(i_ph[1])), ip): ip for ip in phrase_items}
+            for fut in as_completed(futs):
+                idx, t = fut.result()
+                translated[idx] = t
+    out = []
+    for i, (kind, s) in enumerate(items):
+        if kind == "text":
+            out.append(s)
+        else:
+            out.append(translated.get(i, _translate_phrase_cached(s) if not _LATIN_LETTERS_RE.search(s) else s))
+    joined = "".join(out)
+    if joined and joined.rstrip() and joined.rstrip()[-1] not in ".!?":
+        joined = joined.rstrip() + "."
+    return joined
+
+
 def _translate_line_passthrough(line: str) -> str:
-    """Translate only Kannada segments; leave spaces, symbols, digits, and English as-is."""
+    """Translate only Kannada segments (word-level); leave spaces, symbols, digits, and English as-is."""
     if not line.strip():
         return ""
     if not _is_kannada_line(line):
@@ -345,27 +498,16 @@ def _translate_line_passthrough_parallel(line: str) -> str:
 
 def _translate_line_whole(line: str) -> str:
     """
-    Translate an entire line in one API call. Used for /document to avoid hundreds of
-    segment calls (per-word) that timeout Gunicorn. Slightly less precise than segment
-    passthrough but completes for PDF notes like KBinputdoc (~65 lines -> ~65 calls).
+    Translate at phrase level: group consecutive Kannada into phrases, translate each phrase.
+    Fewer API calls than word-level and more natural than one huge line for mixed content.
     """
     if not line.strip():
         return ""
+    if _is_numbering_only_line(line):
+        return ""
     if not _is_kannada_line(line):
         return line
-    if _LATIN_LETTERS_RE.search(line):
-        # Mixed line: still try whole line once; API may return garbage—caller can fallback.
-        try:
-            out = translate_kannada_to_english(line, append_sentence_period=False)
-            if out and out.strip() and out.strip() != line.strip():
-                return out.strip()
-        except Exception:
-            pass
-        return line
-    out = translate_kannada_to_english(line, append_sentence_period=False) or line
-    if out and out.rstrip() and out.rstrip()[-1] not in ".!?":
-        out = out.rstrip() + "."
-    return out
+    return _translate_line_phrase_parallel(line)
 
 
 def _translate_kannada_runs_in_string(s: str) -> str:
@@ -428,10 +570,10 @@ def _fix_document_translation_kannada_leaks(source_text: str, translation: str) 
         # Still Kannada: full segment translate on source (parallel — same quality as image path).
         if _KANNADA_RE.search(tr):
             try:
-                tr = _translate_line_passthrough_parallel(src)
+                tr = _translate_line_phrase_parallel(src)
             except Exception:
                 try:
-                    tr = _translate_line_passthrough(src)
+                    tr = _translate_line_phrase(src)
                 except Exception:
                     pass
         # Second pass: any remaining Kannada → runs only again (mixed safe).
@@ -447,7 +589,7 @@ def _fix_document_translation_kannada_leaks(source_text: str, translation: str) 
         # Last resort: still Kannada — parallel passthrough again (cache may help second time).
         if _KANNADA_RE.search(tr):
             try:
-                tr = _translate_line_passthrough_parallel(src)
+                tr = _translate_line_phrase_parallel(src)
             except Exception:
                 pass
         out.append(tr)
@@ -651,6 +793,7 @@ CUSTOM_TRANSLATION_LINES = {
     "ಯಾರು": "who",
     "ಯಾರಿಗೆ": "to whom",
     "ಹೇಳಿದರು": "said / told",
+    "ಕೂಸು ಕಂದಯ್ಯ": "baby",
 }
 
 
@@ -775,6 +918,159 @@ def translate_kannada_to_english(text: str, append_sentence_period: bool = True)
     except Exception:
         # Gunicorn worker timeout during requests.get can abort worker; catch any leak + always return something
         return inp.strip()
+
+
+def _ai_correct_kannada_line(line: str) -> str:
+    """
+    Optional AI-based correction for OCR'd Kannada text before translation.
+    Uses Google Translate kn→kn (via deep_translator) when USE_AI_CORRECT=1.
+    Falls back to the original line on any error.
+    """
+    if not line or not line.strip():
+        return line
+    if os.environ.get("USE_AI_CORRECT", "").strip().lower() not in ("1", "true", "yes"):
+        return line
+    # Only attempt correction when the line has Kannada script.
+    if not _KANNADA_RE.search(line):
+        return line
+    try:
+        from deep_translator import GoogleTranslator
+        fixed = GoogleTranslator(source="kn", target="kn").translate(text=line)
+        return fixed or line
+    except Exception:
+        return line
+
+
+def _ai_correct_english_line(line: str) -> str:
+    """
+    Optional AI-based correction for translated English text (grammar/fluency).
+    Uses Google Translate en→en (via deep_translator) when USE_AI_CORRECT=1.
+    Falls back to the original line on any error.
+    """
+    if not line or not line.strip():
+        return line
+    if os.environ.get("USE_AI_CORRECT", "").strip().lower() not in ("1", "true", "yes"):
+        return line
+    # Only attempt when line has Latin letters (likely English).
+    if not _LATIN_LETTERS_RE.search(line):
+        return line
+    try:
+        from deep_translator import GoogleTranslator
+        fixed = GoogleTranslator(source="en", target="en").translate(text=line)
+        return fixed or line
+    except Exception:
+        return line
+
+
+def _strip_ocr_garbage_from_line(line: str) -> str:
+    """
+    Remove obvious OCR garbage suffixes (like trailing digit blobs '668!' after a Kannada word)
+    before transliteration/translation. Keeps core Kannada word/phrase intact.
+    """
+    if not line or not line.strip():
+        return line
+    # Only clean lines that contain Kannada; pure English/number lines are left as-is.
+    if not _KANNADA_RE.search(line):
+        return line
+    # Fix specific mid-line garbage we see from OCR, e.g. '€ x :' between Kannada and 'written expression'.
+    # Example raw: 'ಒಂದು ವಾಕ್ಯದಲ್ಲಿ € x :ರೆಯಿರಿ written expression'
+    line = re.sub(r"\s*€\s*x\s*:\s*", " ", line)
+
+    # Strip tiny trailing Latin blobs after Kannada, e.g. 'ಜಗತ್ತಿಗೆ ಮಗು ಏನಾಗಿ. . vw?'
+    # Keep the question mark but drop a 1–3 letter suffix like 'vw' or 'vw?'.
+    if _KANNADA_RE.search(line):
+        line = re.sub(r"\s+[A-Za-z]{1,3}\?*$", "?", line)
+
+    # Strip trailing runs of digits, noisy punctuation, currency, and stray dots/combining marks
+    # (no Kannada chars in that run). This catches things like '668!', '•', '€', broken dotted blobs.
+    cleaned = re.sub(r"[0-9\u00B7\u2022\u2023\u25E6\u2219\u00B0\u00A2-\u00A5\u20A0-\u20CF\u0300-\u036F]+[0-9!@#$%^&*()_+=\\-\\[\\]{};:'\",.<>/?\\|`~\u00B7\u2022\u2023\u25E6\u2219\u00B0\u00A2-\u00A5\u20A0-\u20CF\u0300-\u036F]*\\s*$", "", line)
+    return cleaned.rstrip() or line.strip()
+
+
+# Fixed English labels that often appear after Kannada, where OCR inserts junk symbols in between.
+_OCR_ENGLISH_LABELS = [
+    "written expression",
+    "oral expression",
+    "fill in the blanks",
+]
+
+
+def _filter_ocr_lines(text: str) -> str:
+    """
+    Drop clearly irrelevant OCR lines (timestamps, headers, pure English like 'PDF reader')
+    so they don't appear at the top of results.
+    Keep:
+      - lines containing Kannada script, or
+      - non-empty lines that are not pure timestamp/garbage.
+    """
+    if not text or not text.strip():
+        return text
+    lines = normalize_line_endings(text).splitlines()
+    kept = []
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+        # Count Kannada vs total non-space chars.
+        total = sum(1 for ch in s if not ch.isspace())
+        kn = sum(1 for ch in s if "\u0C80" <= ch <= "\u0CFF")
+
+        # Drop lines with no Kannada at all (pure English/metadata like 'PDF reader', '( Nana kanda notes... Ba:').
+        if kn == 0:
+            continue
+
+        # Drop lines that are mostly digits/symbols with only a stray Kannada char or two
+        # and typical timestamp/garbage symbols like %, € etc.
+        if total > 0 and kn / total < 0.3 and re.search(r"[%€]", s):
+            continue
+
+        kept.append(s)
+    return "\n".join(kept)
+
+
+def _merge_broken_kannada_tokens(line: str) -> str:
+    """
+    Fix simple OCR/PDF word breaks inside Kannada words, for both sajāti and vijāti conjuncts:
+      - 'ಮ ಗು' -> 'ಮಗು' (space between short Kannada tokens)
+      - 'ಕ್ ಕ' / 'ಚ್ ಚ' -> 'ಕ್ಕ' / 'ಚ್ಚ' (space before halant+consonant)
+      - 'ಮುತ್ತ ು' -> 'ಮುತ್ತು' (space before dependent vowel sign)
+    """
+    if not line or not line.strip():
+        return line
+
+    # First pass: merge short, pure-Kannada tokens separated by spaces.
+    tokens = line.split()
+    if len(tokens) < 2:
+        merged = line
+    else:
+        out = []
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+            if (
+                nxt is not None
+                and _KANNADA_RE.fullmatch(tok)
+                and _KANNADA_RE.fullmatch(nxt)
+                and len(tok) <= 2
+                and len(nxt) <= 2
+            ):
+                out.append(tok + nxt)
+                i += 2
+            else:
+                out.append(tok)
+                i += 1
+        merged = " ".join(out)
+
+    # Second pass: remove spaces between base letters and following halant+consonant,
+    # so 'ಕ್ ಕ' / 'ಚ್ ಚ' etc. become 'ಕ್ಕ' / 'ಚ್ಚ'.
+    merged = re.sub(r"([\u0C80-\u0CFF])\s*(\u0CCD[\u0C80-\u0CFF])", r"\1\2", merged)
+
+    # Third pass: remove spaces between base syllable and following dependent vowel signs,
+    # e.g. 'ಮುತ್ತ ು' -> 'ಮುತ್ತು'.
+    merged = re.sub(r"([\u0C80-\u0CFF])\s*([\u0CBE-\u0CCC\u0CD5-\u0CD6])", r"\1\2", merged)
+
+    return merged
 
 
 def normalize_line_endings(text: str) -> str:
@@ -969,7 +1265,20 @@ def _ocr_post_correct(text: str) -> str:
 
     def fix_line(line: str) -> str:
         line = _fix_anusvara_zero(line)
-        # Only touch lines that mention errors/defects in Kannada (ದೋಷ = doṣa).
+        # Fix simple intra-word breaks like 'ಮ ಗು' -> 'ಮಗು'.
+        line = _merge_broken_kannada_tokens(line)
+        # Heuristic: if the line contains one of the known English labels, strip symbol-only
+        # junk immediately before the label (e.g. '€ x :' before 'written expression').
+        for label in _OCR_ENGLISH_LABELS:
+            idx = line.lower().find(label)
+            if idx != -1:
+                pre = line[:idx]
+                post = line[idx:]
+                # Remove trailing non-letter/digit chars (including bullets/currency) from pre.
+                pre_clean = re.sub(r"[^0-9A-Za-z\u0C80-\u0CFF]+$", " ", pre).rstrip()
+                line = (pre_clean + " " + post).strip()
+                break
+        # Only touch bug-lines that mention errors/defects in Kannada (ದೋಷ = doṣa).
         if "ದೋಷ" not in line:
             return line
         # Parenthetical with no Latin letters—digits/Kannada digits only—likely a misread English gloss.
@@ -983,15 +1292,21 @@ def _ocr_post_correct(text: str) -> str:
     return "\n".join(fix_line(ln) for ln in text.splitlines())
 
 
-def _image_to_string_multi(img, langs=("kan+eng", "kan")):
+# OCR language: Kannada + English + numbers (digits). Tesseract "kan+eng" covers all three.
+_OCR_LANGS = ("kan+eng", "kan")
+
+
+def _image_to_string_multi(img, langs=None):
     """
-    Run OCR with a few configs; Latin in parens is often better without harsh binarization
-    or with automatic PSM. Returns best text by heuristic (more a-z in output).
+    Run OCR with Kannada + English + number format. Tries a few PSMs; returns best text
+    by heuristic (more Latin letters in output). langs defaults to _OCR_LANGS.
     """
+    if langs is None:
+        langs = _OCR_LANGS
     configs = [
-        r"--psm 6",
-        r"--psm 3",  # fully automatic; sometimes better for mixed blocks
-        r"--psm 4",  # single column variable size
+        r"--psm 6",   # uniform block of text
+        r"--psm 3",   # fully automatic; sometimes better for mixed blocks
+        r"--psm 4",   # single column variable size
     ]
     best_text, best_score = "", -1
     for _lang in langs:
@@ -1055,40 +1370,53 @@ def ocr():
 
         text = ""
         for img in candidates:
-            text = _image_to_string_multi(img, langs=("kan+eng", "kan"))
+            text = _image_to_string_multi(img, langs=_OCR_LANGS)
             if text.strip():
                 break
         text = normalize_line_endings(text or "").strip()
         text = _ocr_post_correct(text)
+        # Filter out clearly irrelevant OCR lines (timestamps, headers, pure English noise).
+        text = _filter_ocr_lines(text)
+        # Optional AI correction (kn→kn) before any downstream steps.
+        text = preserve_format_line_by_line(text, _ai_correct_kannada_line)
+        # Remove obvious OCR garbage suffixes (e.g. trailing digit blobs) before transliteration.
+        text = preserve_format_line_by_line(text, _strip_ocr_garbage_from_line)
 
+        # Keep original cleaned text for transliteration.
+        text_for_translation = text.replace("ಕೂಸು ಕಂದಯ್ಯ", "ಕಂದ")
+
+        # Line-wise transliteration with word/phrase overrides (after AI + garbage cleanup).
         transliteration = preserve_format_line_by_line(text, _transliterate_line_passthrough) if text else ""
         if transliteration:
             transliteration = _apply_custom_line_overrides(text, transliteration, CUSTOM_TRANSLITERATION_LINES)
             transliteration = _normalize_to_iast(transliteration)
-        # Image OCR long text: sentence (line) translation first, then fallback to segment-wise.
-        if text and (len(text) > 500 or text.count("\n") > 5):
+
+        # Image OCR translation pipeline:
+        # Image → OCR → Clean text → Line split → Word match (overrides) → Translate → Display
+        translation = ""
+        if text_for_translation and (len(text_for_translation) > 500 or text_for_translation.count("\n") > 5):
+            # Long OCR text: phrase translation per line in parallel, then clean Kannada leaks.
             try:
-                translation = preserve_format_line_by_line_parallel(
-                    text, _translate_line_whole
-                )
-                # translation = _naturalize_translation(translation) if translation else ""  # disabled for now
-                translation = _fix_document_translation_kannada_leaks(text, translation)
+                translation = preserve_format_line_by_line_parallel(text_for_translation, _translate_line_phrase_parallel)
+                translation = _fix_document_translation_kannada_leaks(text_for_translation, translation)
             except Exception:
-                translation = preserve_format_line_by_line(text, _translate_line_passthrough)
-                # translation = _naturalize_translation(translation) if translation else ""  # disabled for now
-                translation = _fix_document_translation_kannada_leaks(text, translation)
-            if translation:
-                translation = _strip_kannada_script_from_translation(translation)
+                translation = preserve_format_line_by_line(text_for_translation, _translate_line_phrase)
+                translation = _fix_document_translation_kannada_leaks(text_for_translation, translation)
         else:
-            # Short image OCR: also translate per full line, for more meaningful sentences.
-            translation = preserve_format_line_by_line(text, _translate_line_whole) if text else ""
-            # translation = _naturalize_translation(translation) if translation else ""  # disabled for now
-            translation = _fix_document_translation_kannada_leaks(text, translation) if translation else ""
+            # Short OCR text: phrase translation per line (no morph pipeline).
+            translation = preserve_format_line_by_line(text_for_translation, _translate_line_phrase) if text_for_translation else ""
             if translation:
-                translation = _strip_kannada_script_from_translation(translation)
+                translation = _fix_document_translation_kannada_leaks(text_for_translation, translation)
+
         if translation:
-            translation = _apply_custom_line_overrides(text, translation, CUSTOM_TRANSLATION_LINES)
-            translation = _final_decode_other_language(translation, text)
+            translation = _strip_kannada_script_from_translation(translation)
+        if translation:
+            # Word/phrase-level trained overrides.
+            translation = _apply_custom_line_overrides(text_for_translation, translation, CUSTOM_TRANSLATION_LINES)
+        if translation:
+            # Final AI correction on English (grammar/fluency), then ASCII/Kannada cleanup.
+            translation = preserve_format_line_by_line(translation, _ai_correct_english_line)
+            translation = _final_decode_other_language(translation, text_for_translation)
 
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
@@ -1242,29 +1570,200 @@ def document():
         try:
             # Sentence (line) translation: translate each full line once for more natural English.
             translation = preserve_format_line_by_line_parallel(
-                text, _translate_line_whole
+                text, _translate_line_with_pipeline
             )
             # translation = _naturalize_translation(translation) if translation else ""  # disabled for now
-            translation = _fix_document_translation_kannada_leaks(text, translation)
+            # translation = _fix_document_translation_kannada_leaks(text, translation)  # post-processing: disabled for raw
         except Exception:
             try:
-                # Fallback: segment-wise translate per line if whole-line path fails.
-                translation = preserve_format_line_by_line_parallel(text, _translate_line_passthrough)
+                # Fallback: phrase-wise translate per line if whole-line path fails.
+                translation = preserve_format_line_by_line_parallel(text, _translate_line_phrase_parallel)
                 # translation = _naturalize_translation(translation) if translation else ""  # disabled for now
-                translation = _fix_document_translation_kannada_leaks(text, translation)
+                # translation = _fix_document_translation_kannada_leaks(text, translation)  # post-processing: disabled for raw
             except Exception:
                 translation = ""
-        if translation:
-            translation = _strip_kannada_script_from_translation(translation)
-        if translation:
-            translation = _apply_custom_line_overrides(text, translation, CUSTOM_TRANSLATION_LINES)
-            translation = _final_decode_other_language(translation, text)
+        # if translation:
+        #     translation = _strip_kannada_script_from_translation(translation)  # post-processing: disabled for raw
+        # if translation:
+        #     translation = _apply_custom_line_overrides(text, translation, CUSTOM_TRANSLATION_LINES)  # post-processing: disabled for raw
+        #     translation = _final_decode_other_language(translation, text)  # post-processing: disabled for raw
 
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
             if not has_pro(user_id):
                 increment_free_use(user_id)
             payload["user_status"] = get_user_status(user_id)
+        return jsonify(payload)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --- Morph pipeline: OCR text → tokenize → morphological parse → root lookup → grammar reconstruction → translation ---
+
+def _tokenize_words(line: str) -> list:
+    """Tokenize line into words (split on whitespace). Preserves order."""
+    if not line or not line.strip():
+        return []
+    return line.split()
+
+
+# Optional root dictionary: maps root form -> canonical root (or same). Load from file if present.
+_ROOT_DICT = {}
+_ROOT_DICT_LOADED = False
+
+
+def _load_root_dict():
+    global _ROOT_DICT, _ROOT_DICT_LOADED
+    if _ROOT_DICT_LOADED:
+        return
+    _ROOT_DICT_LOADED = True
+    path = os.environ.get("KANNADA_ROOT_DICT") or os.path.join(os.path.dirname(__file__), "kannada_roots.txt")
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    _ROOT_DICT[parts[0].strip()] = parts[1].strip()
+                else:
+                    _ROOT_DICT[parts[0].strip()] = parts[0].strip()
+    except Exception:
+        pass
+
+
+def _root_lookup(root: str) -> str:
+    """Dictionary lookup for root word. Returns canonical form or the root itself."""
+    if not root or not root.strip():
+        return root
+    _load_root_dict()
+    return _ROOT_DICT.get(root.strip(), root.strip())
+
+
+def _get_root_from_morphemes(morphemes: list, word: str) -> str:
+    """Extract root/stem from morpheme list (typically first morpheme in agglutinative Kannada)."""
+    if not morphemes:
+        return word
+    return morphemes[0].strip() or word
+
+
+def _grammar_reconstruct(tokens: list, roots: list) -> str:
+    """Reconstruct a single string from tokens and their roots (same order, space-joined)."""
+    if not tokens or not roots:
+        return " ".join(tokens) if tokens else ""
+    looked = [_root_lookup(r) for r in roots]
+    return " ".join(looked)
+
+
+def _translate_line_morph_pipeline(line: str) -> str:
+    """
+    Full pipeline: tokenize → morphological parse → root extraction → root dictionary lookup
+    → grammar reconstruction → translation. Use when USE_MORPH_PIPELINE=1.
+    """
+    if not line.strip():
+        return ""
+    if _is_numbering_only_line(line):
+        return ""
+    if not _is_kannada_line(line):
+        return line
+    # 1) Tokenize
+    tokens = _tokenize_words(line)
+    if not tokens:
+        return line
+    # 2) Morphological parse
+    parsed = _morph_parse_kannada_text(line)
+    if not parsed or len(parsed) != len(tokens):
+        # Fallback: translate as phrase if morph or token count mismatch
+        return _translate_line_phrase(line)
+    # 3) Root extraction
+    roots = [_get_root_from_morphemes(p["morphemes"], p["word"]) for p in parsed]
+    # 4) Root lookup (inside _grammar_reconstruct)
+    # 5) Grammar reconstruction
+    reconstructed = _grammar_reconstruct(tokens, roots)
+    if not reconstructed.strip():
+        return line
+    # 6) Translation
+    try:
+        out = translate_kannada_to_english(reconstructed, append_sentence_period=False) or reconstructed
+        if out and out.rstrip() and out.rstrip()[-1] not in ".!?":
+            out = out.rstrip() + "."
+        return out
+    except Exception:
+        return _translate_line_phrase(line)
+
+
+def _translate_line_with_pipeline(line: str) -> str:
+    """Use morph pipeline (tokenize→morph→root lookup→reconstruct→translate) when USE_MORPH_PIPELINE=1 else phrase translation."""
+    if os.environ.get("USE_MORPH_PIPELINE", "").strip().lower() in ("1", "true", "yes"):
+        return _translate_line_morph_pipeline(line)
+    return _translate_line_whole(line)
+
+
+# Lazy-loaded Kannada morphological analyzer (Indic NLP Library). Set INDIC_RESOURCES_PATH if needed.
+_KANNADA_MORPH_ANALYZER = None
+_KANNADA_MORPH_ANALYZER_ERROR = None
+
+
+def _get_kannada_morph_analyzer():
+    """Return UnsupervisedMorphAnalyzer for Kannada if available; else None and error message."""
+    global _KANNADA_MORPH_ANALYZER, _KANNADA_MORPH_ANALYZER_ERROR
+    if _KANNADA_MORPH_ANALYZER_ERROR is not None:
+        return None, _KANNADA_MORPH_ANALYZER_ERROR
+    if _KANNADA_MORPH_ANALYZER is not None:
+        return _KANNADA_MORPH_ANALYZER, None
+    try:
+        from indicnlp.morph.unsupervised_morph import UnsupervisedMorphAnalyzer
+        _KANNADA_MORPH_ANALYZER = UnsupervisedMorphAnalyzer("kn")
+        return _KANNADA_MORPH_ANALYZER, None
+    except Exception as e:
+        _KANNADA_MORPH_ANALYZER_ERROR = str(e)
+        return None, _KANNADA_MORPH_ANALYZER_ERROR
+
+
+def _morph_parse_kannada_text(text: str):
+    """
+    Run Kannada morphological parsing on text. Returns list of {"word": token, "morphemes": [...]}.
+    Non-Kannada tokens are returned with a single morpheme. Uses Indic NLP Library when available.
+    """
+    if not text or not text.strip():
+        return []
+    tokens = text.split()
+    analyzer, err = _get_kannada_morph_analyzer()
+    result = []
+    for token in tokens:
+        morphemes = [token]
+        if _KANNADA_RE.search(token) and analyzer is not None:
+            try:
+                parts = analyzer.morph_analyze(token)
+                if parts:
+                    morphemes = parts
+            except Exception:
+                pass
+        result.append({"word": token, "morphemes": morphemes})
+    return result
+
+
+@app.route("/morph", methods=["POST"])
+def morph():
+    """Kannada morphological parsing. POST JSON: {"text": "ಕನ್ನಡ ಭಾಷೆ"}. Returns words with morpheme breakdown."""
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "Missing or empty 'text' in request body"}), 400
+    try:
+        text = normalize_line_endings(text)
+        text = _fix_anusvara_zero(text)
+        words = _morph_parse_kannada_text(text)
+        analyzer, analyzer_err = _get_kannada_morph_analyzer()
+        payload = {
+            "text": text,
+            "words": words,
+            "morph_engine": "indic_nlp" if analyzer else "fallback",
+            "morph_engine_error": analyzer_err if analyzer_err else None,
+        }
         return jsonify(payload)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1296,26 +1795,26 @@ def text():
         try:
             if use_parallel_segments:
                 translation = preserve_format_line_by_line_parallel(
-                    text, _translate_line_passthrough_parallel
+                    text, _translate_line_with_pipeline
                 )
                 # translation = _naturalize_translation(translation) if translation else ""  # disabled for now
-                translation = _fix_document_translation_kannada_leaks(text, translation)
+                # translation = _fix_document_translation_kannada_leaks(text, translation)  # post-processing: disabled for raw
             else:
-                translation = preserve_format_line_by_line_parallel(text, _translate_line_passthrough)
+                translation = preserve_format_line_by_line_parallel(text, _translate_line_with_pipeline)
                 # translation = _naturalize_translation(translation) if translation else ""  # disabled for now
         except Exception:
             try:
-                translation = preserve_format_line_by_line_parallel(text, _translate_line_passthrough)
+                translation = preserve_format_line_by_line_parallel(text, _translate_line_with_pipeline)
                 # translation = _naturalize_translation(translation) if translation else ""  # disabled for now
-                if use_parallel_segments:
-                    translation = _fix_document_translation_kannada_leaks(text, translation)
+                # if use_parallel_segments:
+                #     translation = _fix_document_translation_kannada_leaks(text, translation)  # post-processing: disabled for raw
             except Exception:
                 translation = ""
-        if translation:
-            translation = _strip_kannada_script_from_translation(translation)
-        if translation:
-            translation = _apply_custom_line_overrides(text, translation, CUSTOM_TRANSLATION_LINES)
-            translation = _final_decode_other_language(translation, text)
+        # if translation:
+        #     translation = _strip_kannada_script_from_translation(translation)  # post-processing: disabled for raw
+        # if translation:
+        #     translation = _apply_custom_line_overrides(text, translation, CUSTOM_TRANSLATION_LINES)  # post-processing: disabled for raw
+        #     translation = _final_decode_other_language(translation, text)  # post-processing: disabled for raw
         payload = {"text": text, "transliteration": transliteration, "translation": translation}
         if user_id is not None:
             payload["user_status"] = get_user_status(user_id)
