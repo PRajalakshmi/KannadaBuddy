@@ -13,6 +13,10 @@ KannadaBuddy ("we", "our", "the app") respects your privacy.
 • Your Kannada text and images are used solely to return transliteration and English meaning. They are not used for marketing or shared with third parties.
 • We use the same backend and translation services only to fulfil your request.
 
+**Advertising and consent**
+• The app may show ads through Google AdMob. Google may use your device advertising ID where allowed by law.
+• If you are in the EEA, UK, or Switzerland, you can withdraw or change consent for personalized ads at any time using **Privacy choices** under **Info & Legal** in this app (required for consent revocation). See also Google's [EU User Consent Policy](https://www.google.com/about/company/user-consent-policy/).
+
 **Data retention**
 • We do not retain your input text or images on our servers after the response is sent.
 • Local app data (e.g. subscription flag) remains on your device until you clear app data or uninstall.

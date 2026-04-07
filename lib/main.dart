@@ -19,7 +19,6 @@ import 'services/iap_service.dart';
 import 'services/ocr_service.dart';
 import 'package:google_mobile_ads/google_mobile_ads.dart';
 import 'package:package_info_plus/package_info_plus.dart';
-
 // Monetization: 2 free file/image uses, then upgrade. Copy & Share require upgrade.
 const int _kFreeUseLimit = 5;
 /// Max characters for typed Kannada text (translation APIs have limits; keep under ~5k).
@@ -34,6 +33,61 @@ const String kSubscriptionPeriod = 'month';
 // to avoid obviously incomplete outputs. For very short text, prefer the
 // typed Kannada input instead of image/document upload.
 const int _kMinEnglishWordsForImageDoc = 8;
+
+/// Full-screen ad when a free user taps **Maybe later** on upgrade from Copy/Share or from image/doc limit.
+const String _kRewardInterstitialAdUnitId = 'ca-app-pub-8200804857823335/4450763976';
+
+/// Outcome of the upgrade sheet ([_UpgradePage]).
+enum UpgradeFlowResult {
+  subscribed,
+  copyShareUnlockedViaAd,
+  mediaUnlockedViaAd,
+  dismissed,
+}
+
+/// Which feature **Maybe later** + interstitial unlocks (non-subscribers only).
+enum _UpgradeInterstitialKind { copyShare, freeMediaLimit }
+
+/// Loads and shows an interstitial; completes after dismiss, failed show/load, or timeout.
+Future<void> _runRewardInterstitial() async {
+  final completer = Completer<void>();
+  var finished = false;
+  void complete() {
+    if (finished) return;
+    finished = true;
+    if (!completer.isCompleted) completer.complete();
+  }
+
+  await InterstitialAd.load(
+    adUnitId: _kRewardInterstitialAdUnitId,
+    request: const AdRequest(),
+    adLoadCallback: InterstitialAdLoadCallback(
+      onAdLoaded: (InterstitialAd ad) {
+        ad.fullScreenContentCallback = FullScreenContentCallback(
+          onAdDismissedFullScreenContent: (InterstitialAd ad) {
+            ad.dispose();
+            complete();
+          },
+          onAdFailedToShowFullScreenContent: (InterstitialAd ad, AdError error) {
+            ad.dispose();
+            complete();
+          },
+        );
+        ad.show();
+      },
+      onAdFailedToLoad: (LoadAdError error) {
+        complete();
+      },
+    ),
+  );
+
+  await completer.future.timeout(
+    const Duration(seconds: 25),
+    onTimeout: () {
+      complete();
+    },
+  );
+}
 
 /// Message when image/document could not be read or translation is not meaningful.
 const String _kUnreadableMessage =
@@ -284,6 +338,8 @@ class _MyAppState extends State<MyApp> {
   int _keyboardPageIndex = 0;
   int _freeUseCount = 0;
   bool _hasUpgraded = false;
+  /// After free image/doc uses are exhausted, user can tap Maybe later + ad once per session to keep uploading.
+  bool _mediaUnlockedViaAdSession = false;
   /// For main page: subscriber name when premium, else 'Guest'.
   String _mainDisplayName = 'Guest';
   /// Pro subscription expiry (ISO date string from backend); null when free or unknown.
@@ -448,20 +504,32 @@ class _MyAppState extends State<MyApp> {
 
   /// Opens upgrade screen first; sign-in is shown only when user taps Subscribe on that screen.
   /// [callerContext] when set (e.g. from Results page) uses its navigator so the route actually opens.
-  Future<bool?> _openUpgradeFlow([BuildContext? callerContext]) async {
+  Future<UpgradeFlowResult?> _openUpgradeFlow({
+    BuildContext? callerContext,
+    bool forCopyShare = false,
+    bool forFreeMediaLimit = false,
+  }) async {
+    _UpgradeInterstitialKind? interstitialKind;
+    if (!_hasUpgraded) {
+      if (forCopyShare) interstitialKind = _UpgradeInterstitialKind.copyShare;
+      if (forFreeMediaLimit) interstitialKind = _UpgradeInterstitialKind.freeMediaLimit;
+    }
     final navigator = callerContext != null
         ? Navigator.of(callerContext)
         : _navigatorKey.currentState;
-    final upgraded = await navigator?.push<bool>(
-      MaterialPageRoute<bool>(
+    final result = await navigator?.push<UpgradeFlowResult>(
+      MaterialPageRoute<UpgradeFlowResult>(
         builder: (context) => _UpgradePage(
           authService: authService,
           onLinkSubscription: _linkSubscriptionToken,
+          maybeLaterInterstitialKind: interstitialKind,
         ),
       ),
     );
-    if (upgraded == true && mounted) await _refreshUserStatusFromBackend();
-    return upgraded;
+    if (result == UpgradeFlowResult.subscribed && mounted) {
+      await _refreshUserStatusFromBackend();
+    }
+    return result;
   }
 
   @override
@@ -595,17 +663,25 @@ class _MyAppState extends State<MyApp> {
           translation: translation,
           hasUpgraded: _hasUpgraded,
           onLinkSubscription: _linkSubscriptionToken,
-          onRequestUpgrade: (ctx) => _openUpgradeFlow(ctx),
+          onRequestUpgrade: (ctx) =>
+              _openUpgradeFlow(callerContext: ctx, forCopyShare: true),
         ),
       ),
     );
   }
 
-  /// Returns true if the user can proceed (under free limit or upgraded).
+  /// Returns true if the user can proceed (under free limit, upgraded, or ad-unlocked session for media).
   Future<bool> _showUpgradeIfNeeded() async {
-    if (_hasUpgraded || _freeUseCount < _kFreeUseLimit) return true;
-    final upgraded = await _openUpgradeFlow();
-    return upgraded == true;
+    if (_hasUpgraded || _freeUseCount < _kFreeUseLimit || _mediaUnlockedViaAdSession) {
+      return true;
+    }
+    final r = await _openUpgradeFlow(forFreeMediaLimit: true);
+    if (r == UpgradeFlowResult.subscribed) return true;
+    if (r == UpgradeFlowResult.mediaUnlockedViaAd) {
+      setState(() => _mediaUnlockedViaAdSession = true);
+      return true;
+    }
+    return false;
   }
 
   Future<void> _translateTypedText() async {
@@ -1285,8 +1361,10 @@ class _MyAppState extends State<MyApp> {
                     builder: (context) => _InfoMenuPage(
                       showUpgrade: !_hasUpgraded,
                       onUpgrade: (ctx) async {
-                        final upgraded = await _openUpgradeFlow(ctx);
-                        if (upgraded == true && mounted) await _refreshUserStatusFromBackend();
+                        final upgraded = await _openUpgradeFlow(callerContext: ctx);
+                        if (upgraded == UpgradeFlowResult.subscribed && mounted) {
+                          await _refreshUserStatusFromBackend();
+                        }
                       },
                       authService: authService,
                       ocrService: ocrService,
@@ -1304,6 +1382,7 @@ class _MyAppState extends State<MyApp> {
                           _mainDisplayName = 'Guest';
                           _hasUpgraded = false;
                           _freeUseCount = 0;
+                          _mediaUnlockedViaAdSession = false;
                           _subscriptionExpiry = null;
                         });
                         _loadMonetizationState();
@@ -1568,12 +1647,13 @@ class _MyAppState extends State<MyApp> {
                 ),
               ],
                 const SizedBox(height: 20),
-              Center(
-                child: Padding(
-                  padding: const EdgeInsets.only(top: 8, bottom: 16),
-                  child: _HomeAdBanner(showForFreeUser: !_hasUpgraded),
+              if (!_hasUpgraded)
+                Center(
+                  child: Padding(
+                    padding: const EdgeInsets.only(top: 8, bottom: 16),
+                    child: const _HomeAdBanner(),
+                  ),
                 ),
-              ),
                 Padding(
                   padding: const EdgeInsets.only(top: 24, bottom: 32),
                   child: Center(
@@ -1608,11 +1688,9 @@ class _MyAppState extends State<MyApp> {
   }
 }
 
-/// Banner ad shown only for free users; hidden for subscribers.
+/// Banner ad for non-subscribers only. Parent must not build this when [_MyAppState._hasUpgraded] is true.
 class _HomeAdBanner extends StatefulWidget {
-  const _HomeAdBanner({required this.showForFreeUser});
-
-  final bool showForFreeUser;
+  const _HomeAdBanner();
 
   @override
   State<_HomeAdBanner> createState() => _HomeAdBannerState();
@@ -1623,28 +1701,13 @@ class _HomeAdBannerState extends State<_HomeAdBanner> {
   bool _isLoaded = false;
 
   static String get _bannerAdUnitId {
-    if (Platform.isAndroid) {
-      return 'ca-app-pub-3940256099942544/6300978111';
-    }
-    return 'ca-app-pub-3940256099942544/2934735716';
+    return 'ca-app-pub-8200804857823335/8777750749';
   }
 
   @override
   void initState() {
     super.initState();
-    if (widget.showForFreeUser) _loadAd();
-  }
-
-  @override
-  void didUpdateWidget(_HomeAdBanner oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (widget.showForFreeUser && !oldWidget.showForFreeUser) {
-      _loadAd();
-    } else if (!widget.showForFreeUser && oldWidget.showForFreeUser) {
-      _bannerAd?.dispose();
-      _bannerAd = null;
-      if (mounted) setState(() => _isLoaded = false);
-    }
+    _loadAd();
   }
 
   void _loadAd() {
@@ -1670,7 +1733,6 @@ class _HomeAdBannerState extends State<_HomeAdBanner> {
 
   @override
   Widget build(BuildContext context) {
-    if (!widget.showForFreeUser) return const SizedBox.shrink();
     if (!_isLoaded || _bannerAd == null) {
       return const SizedBox(height: 50);
     }
@@ -1871,6 +1933,29 @@ class _InfoMenuPage extends StatelessWidget {
             ),
             const Divider(height: 1),
           ],
+          ListTile(
+            leading: Icon(Icons.ads_click_rounded, color: teal, size: 24),
+            title: const Text('Privacy choices', style: TextStyle(fontWeight: FontWeight.w600)),
+            subtitle: Text(
+              'Change or withdraw ad consent (EEA, UK, CH)',
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+            ),
+            trailing: const Icon(Icons.chevron_right_rounded),
+            onTap: () async {
+              await ConsentForm.showPrivacyOptionsForm((FormError? error) {
+                if (!context.mounted) return;
+                if (error != null) {
+                  final msg = error.message.trim().isNotEmpty
+                      ? error.message
+                      : 'Privacy options are not available on this device or region.';
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text(msg)),
+                  );
+                }
+              });
+            },
+          ),
+          const Divider(height: 1),
           ...List.generate(items.length, (index) {
             final (icon, label, title, body) = items[index];
             return ListTile(
@@ -2240,9 +2325,15 @@ class _InfoContentPage extends StatelessWidget {
 }
 
 class _UpgradePage extends StatefulWidget {
-  const _UpgradePage({required this.authService, this.onLinkSubscription});
+  const _UpgradePage({
+    required this.authService,
+    this.onLinkSubscription,
+    this.maybeLaterInterstitialKind,
+  });
   final AuthService authService;
   final Future<void> Function(String? purchaseToken)? onLinkSubscription;
+  /// When set (non-subscriber only), **Maybe later** shows an interstitial then pops the matching [UpgradeFlowResult].
+  final _UpgradeInterstitialKind? maybeLaterInterstitialKind;
 
   @override
   State<_UpgradePage> createState() => _UpgradePageState();
@@ -2275,7 +2366,7 @@ class _UpgradePageState extends State<_UpgradePage> {
         // navigate while the Navigator is locked by the billing flow.
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (!mounted) return;
-          Navigator.of(context).pop(true);
+          Navigator.of(context).pop(UpgradeFlowResult.subscribed);
         });
       },
       onPurchaseCancelOrError: () {
@@ -2428,6 +2519,23 @@ class _UpgradePageState extends State<_UpgradePage> {
     });
   }
 
+  Future<void> _onMaybeLater() async {
+    if (!mounted) return;
+    final kind = widget.maybeLaterInterstitialKind;
+    if (kind != null) {
+      setState(() => _loading = true);
+      await _runRewardInterstitial();
+      if (!mounted) return;
+      setState(() => _loading = false);
+      final result = kind == _UpgradeInterstitialKind.copyShare
+          ? UpgradeFlowResult.copyShareUnlockedViaAd
+          : UpgradeFlowResult.mediaUnlockedViaAd;
+      Navigator.of(context).pop(result);
+      return;
+    }
+    Navigator.of(context).pop(UpgradeFlowResult.dismissed);
+  }
+
   @override
   Widget build(BuildContext context) {
     const primary = Color(0xFF0D7377);
@@ -2558,7 +2666,7 @@ class _UpgradePageState extends State<_UpgradePage> {
                   ),
                   const SizedBox(height: 4),
                   TextButton(
-                    onPressed: _loading ? null : () => Navigator.of(context).pop(false),
+                    onPressed: _loading ? null : _onMaybeLater,
                     child: Text('Maybe later', style: TextStyle(color: Colors.grey.shade700)),
                   ),
                 ],
@@ -2596,7 +2704,7 @@ class _ResultsPage extends StatefulWidget {
   final String translation;
   final bool hasUpgraded;
   final void Function(String? purchaseToken)? onLinkSubscription;
-  final Future<bool?> Function(BuildContext)? onRequestUpgrade;
+  final Future<UpgradeFlowResult?> Function(BuildContext)? onRequestUpgrade;
 
   const _ResultsPage({
     required this.kannada,
@@ -2629,10 +2737,15 @@ class _ResultsPageState extends State<_ResultsPage> {
   );
 
   Future<void> _refreshUpgradedAndRun(BuildContext context, Future<void> Function() action) async {
-    final upgraded = await widget.onRequestUpgrade?.call(context) ?? false;
-    if (upgraded != true || !context.mounted) return;
-    final prefs = await SharedPreferences.getInstance();
-    if (prefs.getBool(_kKeyHasUpgraded) ?? false) {
+    final result = await widget.onRequestUpgrade?.call(context);
+    if (!context.mounted) return;
+    if (result == UpgradeFlowResult.subscribed) {
+      final prefs = await SharedPreferences.getInstance();
+      if (prefs.getBool(_kKeyHasUpgraded) ?? false) {
+        setState(() => _isUpgraded = true);
+        await action();
+      }
+    } else if (result == UpgradeFlowResult.copyShareUnlockedViaAd) {
       setState(() => _isUpgraded = true);
       await action();
     }
